@@ -1,0 +1,2 @@
+signal_time,direction,entry_mid,balance_before,exit_time,exit_reason,tp1_hit,tp2_hit,filled,lot_main,lot_runner,pnl,balance_after
+2025-04-22 20:00:00,SELL,3334.675,210.058202000019,2025-04-22 20:01:00,sl,False,False,True,0.1,0.05,-190.13999999999723,19.91820200002178

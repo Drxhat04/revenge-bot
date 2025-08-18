@@ -1,0 +1,2 @@
+signal_time,direction,entry_mid,balance_before,exit_time,exit_reason,tp1_hit,tp2_hit,filled,lot_main,lot_runner,pnl,balance_after
+2025-07-07 05:46:00,SELL,3304.625,33.96946800000286,2025-07-07 10:47:00,force_close,False,False,True,0.02,0.01,-20.615999999999183,13.35346800000368

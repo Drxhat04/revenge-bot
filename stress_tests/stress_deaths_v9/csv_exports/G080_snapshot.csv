@@ -1,0 +1,2 @@
+signal_time,direction,entry_mid,balance_before,exit_time,exit_reason,tp1_hit,tp2_hit,filled,lot_main,lot_runner,pnl,balance_after
+2022-07-22 11:47:00,BUY,1735.7305000000001,117.01250999999904,2022-07-22 16:13:00,sl,False,False,True,0.05,0.025,-109.99124999999962,7.021259999999415

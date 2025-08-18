@@ -1,0 +1,48 @@
+# === Session filter (Europe/Berlin local time) ===
+sessions:
+  - "07:00-10:00"
+  - "11:00-15:00"
+
+# === Asia session used by the scanner (wraps midnight) ===
+asia_start: "18:00"          # previous‑day evening
+asia_end:   "09:00"          # current‑day morning
+tokyo_only: false            # true → ignore asia_start / asia_end and use 00:00‑06:00 UTC
+
+# === Geometry ===
+zone_width_usd:   7.0        # OB width cap
+sweep_buffer_usd: 0.05       # min pierce distance
+
+# === Logic switches ===
+require_pierce:  false        # false → accept an OB even if Asia range wasn’t swept
+require_fvg:     true        # false → skip the FVG‑gap filter
+
+# === Risk & target multipliers ===
+risk_mult: 2.3
+tp1_mult:  0.68
+tp2_mult:  1.16
+
+# === Diagnostics ===
+debug_days: 3                # 0 = silent
+
+# === Trade‑management ===
+no_touch_timeout_hours: 3
+force_close_hours:      5
+# tp_before_sl_same_bar: true   # uncomment for SL‑first logic
+
+# === Dealing costs ===
+tick_size:           0.01
+slip_usd_side_lot:   3.52
+use_csv_spread:      true
+# dollar_per_unit_per_lot: 100.0   # only change for non‑gold instruments
+
+# === Lot‑sizing (“mid‑risk” table) ===
+lot_table:
+  - [0,     50,     0.02]
+  - [50,    100,    0.02]
+  - [100,   200,    0.05]
+  - [200,   500,    0.10]
+  - [500,   1000,   0.25]
+  - [1000,  5000,   0.50]
+  - [5000,  1e12,   1.00]
+
+start_balance: 1000.0

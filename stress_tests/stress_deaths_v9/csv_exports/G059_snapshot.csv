@@ -1,0 +1,3 @@
+signal_time,direction,entry_mid,balance_before,exit_time,exit_reason,tp1_hit,tp2_hit,filled,lot_main,lot_runner,pnl,balance_after
+2020-08-12 11:00:00,BUY,1938.843,103.12917999999875,2020-08-12 12:09:00,sl,False,False,True,0.05,0.025,-79.29,23.83917999999875
+2020-07-14 20:00:00,SELL,1808.163,23.83917999999875,2020-07-14 21:09:00,be,True,False,True,0.02,0.01,1.1773200000001307,25.016499999998878

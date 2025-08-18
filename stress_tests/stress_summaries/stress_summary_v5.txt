@@ -1,0 +1,6 @@
+
+=== Monte‑Carlo v5.3 summary (500/500 runs) ===
+equity_final   : $13,915 – 19,801 – $25,131
+max_dd%%  : $0.00 % – 10.81 % – 21.12 %
+win‑rate       : 86.89% – 91.49% – 96.92%
+profit factor  : 290.71 – 1234.26 – 23136.40

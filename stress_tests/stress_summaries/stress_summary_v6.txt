@@ -1,0 +1,6 @@
+
+=== Monte‑Carlo v6 summary (500/500 runs) ===
+equity_final : $10,739 – 19,425 – $25,470
+max_dd_pct   : 0.00% – 11.35% – 29.61%
+win‑rate     : 85.48% – 90.68% – 97.18%
+profit fact. : 21.24 – 1221.81 – 25158.43

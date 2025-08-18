@@ -1,0 +1,6 @@
+
+=== Monte‑Carlo v7 summary (500/500 runs) ===
+equity_final : $312 – 12,524 – $19,533
+max_dd_pct   : 0.00% – 18.39% – 56.08%
+win‑rate     : 79.37% – 86.45% – 100.00%
+profit fact. : 4.13 – 30.67 – 633.84

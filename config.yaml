@@ -1,0 +1,79 @@
+# === Session filter (UTC) ===
+sessions:
+  - "06:00-09:00"   # former Berlin 07:00-10:00
+  - "10:00-14:00"   # former Berlin 11:00-15:00
+
+# === Asia session used by the scanner (UTC) ===
+asia_start: "18:00"
+asia_end:   "09:00"
+tokyo_only: false
+
+# === Geometry ===
+zone_width_usd:    5.0
+sweep_buffer_usd:  0.1  # 0.05 was too tight for early 2025
+
+# === Logic switches ===
+require_pierce: false
+require_fvg:    true
+gap_filter:     0.005
+
+# === Risk & target multipliers ===
+risk_mult:      2.3
+tp1_mult:       0.68
+tp2_mult:       1.16
+max_risk_ratio: 0.03
+
+# === Volatility Controls ===
+volatility_adjust: true
+atr_period:        14
+atr_multiplier:    3.0
+
+# === Diagnostics ===
+debug_days: 3
+
+# === Trade Management ===
+no_touch_timeout_hours: 3
+force_close_hours:      24
+dynamic_stops:          true
+
+# === Swap Fee Management ===
+swap_avoidance:       false
+swap_cutoff_hour:     19       # UTC (20:00 Berlin → 19:00 UTC)
+swap_buffer_hours:    3
+wednesday_multiplier: 3
+swap_fee_long:        -5.10    # $ per lot per night
+swap_fee_short:        0.00    # $ per lot per night
+
+# === Dealing costs ===
+tick_size:                   0.0     # zero-spread account
+use_csv_spread:              false
+slip_usd_side_lot:           5.0
+commission_per_lot_per_side: 5.5     # $ per lot per side
+
+# === Slippage scaling ===
+slippage_scale_threshold_lots: 1.5
+slippage_scale_factor:         1.0
+
+# === Position Sizing ===
+risk_per_trade:           0.10
+max_lots:                 2.3
+min_lot_size:             0.01
+lot_size_increment:       0.01
+dollar_per_unit_per_lot:  100.0   # 1 USD move × 100 oz = 100 USD P/L per 1 lot
+
+# === Entry logic (engine v10+) ===
+entry_trigger: "band"          # "band" or "mid"
+band_side_buy: "upper"         # "upper" → [mid, high], "lower" → [low, mid]
+band_side_sell: "lower"        # "lower" → [low, mid],  "upper" → [mid, high]
+band_entry_threshold: 0.00     # 0.00 = at mid edge, 0.50 = halfway, 1.00 = far edge
+band_fill_price: "threshold"   # "threshold" or "touch"
+entry_min_delay_minutes: 1     # avoid instant same-minute fills
+
+# === Risk Management ===
+day_loss_limit_pct: 0.05
+
+# === Leverage / Margin ===
+leverage: 1000        # e.g. 1:500 on Zero account
+
+# === Account Capital ===
+start_balance: 100.0

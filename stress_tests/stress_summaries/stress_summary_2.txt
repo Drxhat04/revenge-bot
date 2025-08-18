@@ -1,0 +1,5 @@
+=== Monte‑Carlo summary (500 / 500 successful runs) ===
+equity_final  :  min $7,423  mean $10,147  max $12,328
+max_draw_down :  min $50  mean $300  max $899
+win‑rate      :  min 92.98%  mean 94.10%  max 94.74%
+profit factor :  min 7.23  mean 40.84  max 131.49
