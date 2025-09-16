@@ -17,6 +17,17 @@ require_pierce: false
 require_fvg:    true
 gap_filter:     0.005
 
+login: 81496583          # your MT5 account number
+password: "Password2$"    # your MT5 password
+server: "Exness-MT5Trial10" # the broker server name (exact)
+
+symbol: "XAUUSDz"       # match your broker symbol exactly
+use_live_mt5: true      # prefer live MT5 data for scanning
+force_test_entry: false
+filling_override: "IOC"
+
+deviation: 500
+
 # === Risk & target multipliers ===
 risk_mult:      2.3
 tp1_mult:       0.68
@@ -35,6 +46,9 @@ debug_days: 3
 no_touch_timeout_hours: 3
 force_close_hours:      24
 dynamic_stops:          true
+place_sl_on_entry: true          # set broker SL on entry
+place_tp_on_entry: "none"        # "none" | "tp1" | "tp2"
+
 
 # === Swap Fee Management ===
 swap_avoidance:       false

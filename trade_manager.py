@@ -6,13 +6,11 @@ from typing import List, Dict, Optional, Tuple
 from datetime import datetime, timedelta, timezone
 import re
 import MetaTrader5 as mt5
-from datetime import datetime, timedelta
 
 from config import CONFIG
 from utils import fmt_time, is_near_swap_cutoff, now_utc
 
-
-# ─────────────────────────── MT5 helpers ───────────────────────────
+# ─────────────────────────── Helpers ───────────────────────────
 
 @dataclass
 class SymbolFilters:
@@ -42,6 +40,73 @@ def _get_symbol_filters(symbol: str) -> SymbolFilters:
         digits=int(getattr(info, "digits", 2)),
     )
 
+def _normalize_price(symbol: str, price: float) -> float:
+    """
+    Align price to the symbol's trade_tick_size (preferred) or point, then round to digits.
+    Prevents TRADE_RETCODE_INVALID_PRICE (10009).
+    """
+    info = mt5.symbol_info(symbol)
+    if info is None:
+        return float(price)
+    digits  = int(getattr(info, "digits", 2))
+    tick_sz = float(getattr(info, "trade_tick_size", 0.0) or getattr(info, "point", 0.0) or 0.0)
+    p = float(price)
+    if tick_sz > 0:
+        p = round(round(p / tick_sz) * tick_sz, digits)
+    else:
+        p = round(p, digits)
+    return p
+
+def _stops_min_distance(symbol: str) -> float:
+    """
+    Convert broker stops level (points) to price distance.
+    """
+    info = mt5.symbol_info(symbol)
+    if info is None:
+        return 0.0
+    level_pts = int(getattr(info, "trade_stops_level", 0) or 0)
+    # Prefer trade_tick_size if present, else point
+    tick = float(getattr(info, "trade_tick_size", 0.0) or getattr(info, "point", 0.0) or 0.0)
+    return float(level_pts) * float(tick)
+
+def _respect_stops_level(symbol: str, raw_sl: Optional[float], raw_tp: Optional[float],
+                         direction: str, ref_bid: float, ref_ask: float) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Ensure SL/TP are at least broker min distance from current market.
+    Adds a one-tick buffer if needed.
+    """
+    if raw_sl is None and raw_tp is None:
+        return None, None
+
+    info = mt5.symbol_info(symbol)
+    if info is None:
+        return raw_sl, raw_tp
+
+    min_dist = _stops_min_distance(symbol)
+    tick = float(getattr(info, "trade_tick_size", 0.0) or getattr(info, "point", 0.0) or 0.0)
+    buf = tick  # 1 extra tick for safety
+
+    sl = raw_sl
+    tp = raw_tp
+
+    if direction == "BUY":
+        # Closing side for SL is bid; for TP we check ask.
+        if sl is not None and (ref_bid - sl) < (min_dist + buf):
+            sl = ref_bid - (min_dist + buf)
+        if tp is not None and (tp - ref_ask) < (min_dist + buf):
+            tp = ref_ask + (min_dist + buf)
+    else:
+        # SELL
+        if sl is not None and (sl - ref_ask) < (min_dist + buf):
+            sl = ref_ask + (min_dist + buf)
+        if tp is not None and (ref_bid - tp) < (min_dist + buf):
+            tp = ref_bid - (min_dist + buf)
+
+    # Normalize to tradable increments
+    sl = None if sl is None else _normalize_price(symbol, sl)
+    tp = None if tp is None else _normalize_price(symbol, tp)
+    return sl, tp
+
 def _quantize_volume(vol: float, f: SymbolFilters) -> float:
     if vol <= 0:
         return 0.0
@@ -62,10 +127,23 @@ def _current_prices(symbol: str) -> Tuple[float, float]:
         raise RuntimeError("No tick data")
     return float(tick.bid), float(tick.ask)
 
+def _close_filling():
+    """
+    Respect filling_override for closes; default to IOC.
+    """
+    ov = str(CONFIG.get("filling_override", "") or "").upper().strip()
+    if ov == "FOK":
+        return mt5.ORDER_FILLING_FOK
+    # Default (and Exness-friendly)
+    return mt5.ORDER_FILLING_IOC
+
+# ─────────────────────────── MT5 actions ───────────────────────
+
 def _send_close_market(symbol: str, volume: float, close_side: str, reason: str) -> dict:
     bid, ask = _current_prices(symbol)
     order_type = mt5.ORDER_TYPE_SELL if close_side == "bid" else mt5.ORDER_TYPE_BUY
-    price = bid if close_side == "bid" else ask
+    raw_price = bid if close_side == "bid" else ask
+    price = _normalize_price(symbol, raw_price)
 
     req = {
         "action": mt5.TRADE_ACTION_DEAL,
@@ -77,36 +155,73 @@ def _send_close_market(symbol: str, volume: float, close_side: str, reason: str)
         "magic": int(CONFIG.get("magic", 234000)),
         "comment": f"exit: {reason}",
         "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC,
+        "type_filling": _close_filling(),
     }
 
     check = mt5.order_check(req)
     if check is None or getattr(check, "retcode", 0) != mt5.TRADE_RETCODE_DONE:
-        return {"ok": False, "stage": "order_check", "retcode": None if check is None else check.retcode, "request": req}
+        return {
+            "ok": False,
+            "stage": "order_check",
+            "retcode": None if check is None else check.retcode,
+            "comment": None if check is None else getattr(check, "comment", ""),
+            "request": req,
+        }
 
     res = mt5.order_send(req)
-    ok = getattr(res, "retcode", 0) in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED)
-    return {"ok": ok, "stage": "order_send", "result": res._asdict() if hasattr(res, "_asdict") else res, "price": price}
+    rc = getattr(res, "retcode", 0) if res is not None else None
+    ok = rc in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED)
+    return {
+        "ok": ok,
+        "stage": "order_send",
+        "retcode": rc,
+        "comment": getattr(res, "comment", "") if res is not None else None,
+        "result": res._asdict() if hasattr(res, "_asdict") else res,
+        "price": price,
+    }
 
-def _modify_position_sl_tp(symbol: str, ticket: int, *, sl: Optional[float] = None, tp: Optional[float] = None) -> dict:
+def _modify_position_sl_tp(symbol: str, ticket: int, *,
+                           sl: Optional[float] = None, tp: Optional[float] = None) -> dict:
+    """
+    Modify SL/TP on an existing position, normalizing and respecting min stop distance.
+    """
+    # Get current prices + direction to apply min distance properly
+    pos_list = mt5.positions_get(ticket=ticket)
+    if not pos_list:
+        return {"ok": False, "stage": "lookup", "error": "position_not_found", "ticket": ticket}
+
+    pos = pos_list[0]
+    direction = "BUY" if pos.type == mt5.ORDER_TYPE_BUY else "SELL"
+    bid, ask = _current_prices(symbol)
+
+    sl_adj, tp_adj = _respect_stops_level(symbol, sl, tp, direction, bid, ask)
+
     req = {
         "action": mt5.TRADE_ACTION_SLTP,
         "symbol": symbol,
         "position": int(ticket),
     }
-    if sl is not None:
-        req["sl"] = float(sl)
-    if tp is not None:
-        req["tp"] = float(tp)
+    if sl_adj is not None:
+        req["sl"] = float(sl_adj)
+    if tp_adj is not None:
+        req["tp"] = float(tp_adj)
 
     res = mt5.order_send(req)
-    ok = getattr(res, "retcode", 0) in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED)
-    return {"ok": ok, "stage": "modify", "result": res._asdict() if hasattr(res, "_asdict") else res}
-
+    rc = getattr(res, "retcode", 0) if res is not None else None
+    ok = rc in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED)
+    return {
+        "ok": ok,
+        "stage": "modify",
+        "retcode": rc,
+        "comment": getattr(res, "comment", "") if res is not None else None,
+        "requested": {"sl": sl, "tp": tp},
+        "applied": {"sl": sl_adj, "tp": tp_adj},
+        "result": res._asdict() if hasattr(res, "_asdict") else res,
+    }
 
 # ─────────────────────────── Core logic ───────────────────────────
 
-RUNNER_FRACTION_OF_TOTAL = 1.0 / 3.0   # matches engine: runner = 0.5*base → runner/total = 1/3
+RUNNER_FRACTION_OF_TOTAL = 1.0 / 3.0   # runner = 1/3 of total (base 2/3 + runner 1/3)
 MAIN_FRACTION_OF_TOTAL   = 1.0 - RUNNER_FRACTION_OF_TOTAL  # 2/3
 
 def get_open_positions(symbol: str, magic: int):
@@ -147,7 +262,6 @@ def _infer_stop_distance(pos) -> float:
     if sd is not None and sd > 0:
         return sd
 
-    # Fallback
     structural = float(CONFIG.get("risk_mult", 2.3)) * float(CONFIG.get("zone_width_usd", 5.0))
     return max(float(CONFIG.get("min_stop_usd", 1.0)), structural)
 
@@ -255,26 +369,23 @@ def partial_close_and_move_be(pos, main_fraction: float, be_price: float, reason
     close_vol = _quantize_volume(total * main_fraction, filters)
 
     # If close amount is smaller than min lot, skip partial but still try BE move
-    close_result = None
     if close_vol >= filters.min_lot and close_vol <= total:
         close_result = _send_close_market(symbol, close_vol, close_side, reason)
     else:
         close_result = {"ok": False, "stage": "partial_skip", "reason": "below_min_lot"}
 
-    # After partial, move SL of remaining position to BE
+    # After partial, move SL of remaining position to BE (respect stops level)
     # Re-query position because volume may have changed
     pos_after = mt5.positions_get(ticket=pos.ticket)
-    # Some brokers re-use same ticket; if not found, obtain any position for symbol/magic
-    current_pos = pos
-    if pos_after and len(pos_after) == 1:
-        current_pos = pos_after[0]
+    current_pos = pos if not pos_after else pos_after[0]
 
-    mod = _modify_position_sl_tp(symbol, int(current_pos.ticket), sl=be_price, tp=None)
+    be_norm = _normalize_price(symbol, be_price)
+    mod = _modify_position_sl_tp(symbol, int(current_pos.ticket), sl=be_norm, tp=None)
 
     return {
-        "partial_ok": close_result.get("ok", False),
+        "partial_ok": bool(close_result.get("ok", False)),
         "partial_result": close_result,
-        "move_be_ok": mod.get("ok", False),
+        "move_be_ok": bool(mod.get("ok", False)),
         "move_be_result": mod,
     }
 
@@ -284,7 +395,6 @@ def manage_all_trades() -> List[dict]:
     """
     symbol = CONFIG["symbol"]
     magic = int(CONFIG["magic"])
-    filters = _get_symbol_filters(symbol)
 
     open_trades = get_open_positions(symbol, magic)
     closed_logs: List[dict] = []

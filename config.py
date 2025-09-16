@@ -3,7 +3,7 @@ import yaml
 from pathlib import Path
 
 DEFAULTS = {
-    "symbol": "XAUUSD",
+    "symbol": "XAUUSDz",
 
     # Session (UTC)
     "sessions": ["06:00-09:00", "10:00-14:00"],

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 from typing import Iterable, Tuple, Optional
+import time
 import MetaTrader5 as mt5
 from datetime import datetime, timedelta, time as dtime, timezone
 from config import CONFIG
@@ -79,9 +80,10 @@ def init_mt5(*, login: int | None = None, password: str | None = None,
              server: str | None = None, path: str | None = None) -> None:
     """
     Initialize MT5, optionally logging into a specific account/server.
-    Selects the configured symbol.
+    Selects the configured symbol and warms up ticks to avoid stale price errors.
     """
-    if not mt5.initialize(path) if path else not mt5.initialize():
+    ok = mt5.initialize(path) if path else mt5.initialize()
+    if not ok:
         raise RuntimeError(f"MT5 initialization failed: {mt5.last_error()}")
 
     # Optional login (if you run multiple accounts)
@@ -106,7 +108,17 @@ def init_mt5(*, login: int | None = None, password: str | None = None,
         mt5.shutdown()
         raise RuntimeError(f"Symbol {symbol} trade mode is disabled")
 
-    print(f"MT5 initialized; symbol '{symbol}' ready (digits={info.digits}, contract={getattr(info,'trade_contract_size', 'n/a')}).")
+    # Warm up terminal/ticks to avoid invalid price (10009) right after init/login
+    for _ in range(5):
+        if mt5.symbol_info_tick(symbol):
+            break
+        time.sleep(0.2)
+    time.sleep(0.2)
+
+    print(
+        f"MT5 initialized; symbol '{symbol}' ready "
+        f"(digits={info.digits}, contract={getattr(info,'trade_contract_size', 'n/a')})."
+    )
 
 
 def shutdown_mt5() -> None:
