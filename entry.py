@@ -152,93 +152,111 @@ def send_market_order(direction: str, entry_price_ref: float, stop_dist: float,
                       *, trigger_price: float | None = None) -> dict:
     symbol = CONFIG["symbol"]
 
-    # 1) Size
+    # 1) Size — keep legacy 1.5× boost for parity with your "working" version
+    lot_boost = float(CONFIG.get("entry_lot_boost", 1.5))
     base_lots = calculate_position_size(stop_dist, entry_price_ref)
     if base_lots <= 0:
         raise RuntimeError("Lot sizing returned zero — check margin/equity/config")
-    total_lots = _quantize_to_step(base_lots * 1.5, symbol)
+    total_lots = _quantize_to_step(base_lots * lot_boost, symbol)
 
-    # 2) Fit to margin
+    # 2) Fit to margin using current side price
     bid, ask = fetch_tick(symbol)
-    side_price = ask if direction == "BUY" else bid
+    side_price = ask if direction.upper() == "BUY" else bid
     total_lots = _fit_to_margin(symbol, total_lots, side_price)
     if total_lots <= 0:
         raise RuntimeError("Not enough free margin for requested volume")
 
-    # 3) Build comment
+    # 3) Comment
     bits = [f"sd={stop_dist:.2f}"]
     if trigger_price is not None:
         bits.append(f"trig={trigger_price:.2f}")
     comment = " ".join(bits)
 
     attempts = []
-    last_error = None
-    price_used = None
+    requested_price = None
+    entry_result = None
+    tries_per_mode = int(CONFIG.get("tries_per_fill_mode", 6))
+    pause = float(CONFIG.get("retry_sleep_seconds", 0.12))
 
-    for fill_const, fill_label in _supported_fillings(symbol):
-        for _ in range(6):  # retry per filling with fresh price
-            bid, ask = fetch_tick(symbol)
-            price_used = _normalize_price(symbol, ask if direction == "BUY" else bid)
+    def _log(fill_label, price_used, check_obj, send_obj):
+        try:
+            le = mt5.last_error()
+        except Exception:
+            le = None
+        attempts.append({
+            "filling": fill_label,
+            "price": price_used,
+            "check_retcode": getattr(check_obj, "retcode", None) if check_obj is not None else None,
+            "check_comment": getattr(check_obj, "comment", None) if check_obj is not None else None,
+            "send_retcode": getattr(send_obj, "retcode", None) if send_obj is not None else None,
+            "send_comment": getattr(send_obj, "comment", None) if send_obj is not None else None,
+            "send_last_error": le,
+        })
+
+    def _try_mode(fill_const, fill_label, place_sltp: bool, include_filling: bool) -> bool:
+        nonlocal entry_result, requested_price
+        for _ in range(tries_per_mode):
+            b, a = fetch_tick(symbol)
+            price_used = _normalize_price(symbol, a if direction.upper() == "BUY" else b)
+            requested_price = price_used
 
             req = _build_request(direction, symbol, price_used, total_lots, comment)
-            req["type_filling"] = fill_const
+            if include_filling:
+                req["type_filling"] = fill_const
 
-            # NEW: set broker-side SL/TP according to config
-            _apply_sltp_policy(symbol, req, direction, price_used, stop_dist)
+            # NOTE: use price_used (live) for SL/TP math — matches your previous working behavior
+            if place_sltp:
+                _apply_sltp_policy(symbol, req, direction, price_used, stop_dist)
 
             # pre-check
             check = mt5.order_check(req)
-            check_rc = getattr(check, "retcode", None)
-            check_cmt = getattr(check, "comment", "")
-
-            if check_rc not in (mt5.TRADE_RETCODE_DONE, 0):
-                attempts.append({
-                    "filling": fill_label, "price": price_used,
-                    "check_retcode": check_rc, "check_comment": check_cmt,
-                    "send_retcode": None, "send_comment": None,
-                })
-                break  # no point in retrying this filling if precheck fails
+            if check is None or getattr(check, "retcode", None) not in (mt5.TRADE_RETCODE_DONE, 0):
+                _log(fill_label, price_used, check, None)
+                time.sleep(pause)
+                continue
 
             # send
             res = mt5.order_send(req)
-            send_rc = getattr(res, "retcode", None) if res is not None else None
-            send_cmt = getattr(res, "comment", "") if res is not None else None
+            _log(fill_label, price_used, check, res)
 
-            attempts.append({
-                "filling": fill_label, "price": price_used,
-                "check_retcode": check_rc, "check_comment": check_cmt,
-                "send_retcode": send_rc, "send_comment": send_cmt,
-            })
+            if res is not None and getattr(res, "retcode", None) in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED):
+                entry_result = res
+                return True
 
-            if res is not None and send_rc in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED):
-                return {
-                    "requested_lots": total_lots,
-                    "requested_price": price_used,
-                    "entry_time": datetime.utcnow(),
-                    "entry_result": res,
-                    "attempts": attempts,
-                    "comment_used": _sanitize_comment(comment, 24),
-                }
+            time.sleep(pause)
+        return False
 
-            try:
-                last_error = mt5.last_error()
-            except Exception:
-                last_error = None
+    fillings = _supported_fillings(symbol)  # typically IOC then FOK unless you forced it in config
 
-            time.sleep(0.02)
+    # A) IOC/FOK with SL/TP
+    for fc, fl in fillings:
+        if _try_mode(fc, fl, place_sltp=True, include_filling=True):
+            break
 
-    if last_error is None:
-        try:
-            last_error = mt5.last_error()
-        except Exception:
-            last_error = None
+    # B) IOC/FOK without SL/TP (broker min-distance quirks)
+    if entry_result is None:
+        for fc, fl in fillings:
+            if _try_mode(fc, f"{fl}-noSLTP", place_sltp=False, include_filling=True):
+                break
+
+    # C) AUTO filling (omit type_filling) — first without SL/TP, then with
+    if entry_result is None:
+        _try_mode(None, "AUTO-noSLTP", place_sltp=False, include_filling=False)
+    if entry_result is None:
+        _try_mode(None, "AUTO", place_sltp=True, include_filling=False)
+
+    # final last_error snapshot
+    try:
+        last_err = mt5.last_error()
+    except Exception:
+        last_err = None
 
     return {
         "requested_lots": total_lots,
-        "requested_price": price_used,
+        "requested_price": float(requested_price) if requested_price is not None else float(side_price),
         "entry_time": datetime.utcnow(),
-        "entry_result": None,
+        "entry_result": entry_result,
         "attempts": attempts,
-        "last_error": last_error,
+        "last_error": last_err,
         "comment_used": _sanitize_comment(comment, 24),
     }

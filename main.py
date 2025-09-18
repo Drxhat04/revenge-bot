@@ -25,6 +25,14 @@ def _robust_stop(zone_row) -> float:
     return struct
 
 
+def _effective_entry_price(direction: str, trigger_price: float, bid: float, ask: float) -> float:
+    fp = str(CONFIG.get("band_fill_price", "touch")).lower().strip()
+    if fp == "threshold":
+        return float(trigger_price)
+    # "touch" → use current market side
+    return float(ask if direction == "BUY" else bid)
+
+
 def _m1_gap_excessive(symbol: str, ref_price: float) -> bool:
     rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M1, 0, 2)
     if rates is None or len(rates) < 2:
@@ -44,27 +52,32 @@ def _print_last_error(prefix: str, now: datetime):
         pass
 
 
-def _dump_attempts(prefix: str, order: dict, now: datetime):
+def _dump_attempts(prefix: str, order, now: datetime):
     """
     Pretty-print the attempt log returned by entry.send_market_order.
-    Each attempt has: filling, price, check_retcode, check_comment, send_retcode, send_comment
+    Safe if 'order' is None or not a dict.
     """
+    if not isinstance(order, dict):
+        print(f"{now} → {prefix} attempts: <no order/unknown type>")
+        return
     attempts = order.get("attempts", []) or []
     if not attempts:
         print(f"{now} → {prefix} attempts: <none>")
         return
     print(f"{now} → {prefix} attempts ({len(attempts)}):")
     for i, att in enumerate(attempts, 1):
-        print(
-            f"  #{i} fill={att.get('filling')} "
-            f"price={att.get('price')} "
-            f"check={att.get('check_retcode')}('{att.get('check_comment')}') "
-            f"send={att.get('send_retcode')}('{att.get('send_comment')}')"
-        )
+        try:
+            print(
+                f"  #{i} fill={att.get('filling')} "
+                f"price={att.get('price')} "
+                f"check={att.get('check_retcode')}('{att.get('check_comment')}') "
+                f"send={att.get('send_retcode')}('{att.get('send_comment')}')"
+            )
+        except Exception as e:
+            print(f"  #{i} <print-error: {e}>  raw={att}")
 
 
 def _print_env_caps(prefix: str):
-    """Dump terminal/account/symbol trading capability flags for debugging."""
     try:
         ti = mt5.terminal_info()
         ai = mt5.account_info()
@@ -82,14 +95,74 @@ def _print_env_caps(prefix: str):
         print(f"{prefix} env-caps error: {e}")
 
 
+def _as_naive_utc(ts) -> datetime:
+    """
+    Coerce any pandas/python datetime (aware or naive) to naive UTC.
+    """
+    t = pd.Timestamp(ts)
+    if t.tzinfo is not None:
+        t = t.tz_convert("UTC").tz_localize(None)
+    return t.to_pydatetime()
+
+
+def _send_order_safe(direction: str, eff_px: float, stop_dist: float, trig: float):
+    """
+    Wrap send_market_order so the caller always gets a dict with
+    at least: entry_result, attempts, last_error, requested_price, requested_lots.
+    This protects the live loop if an unexpected None/non-dict is returned.
+    """
+    try:
+        out = send_market_order(direction, eff_px, stop_dist, trigger_price=trig)
+        if out is None:
+            # Coerce to failure-shaped dict
+            le = None
+            try:
+                le = mt5.last_error()
+            except Exception:
+                pass
+            return {
+                "entry_result": None,
+                "attempts": [],
+                "last_error": le or ("send_market_order_returned_none",),
+                "requested_lots": 0.0,
+                "requested_price": eff_px,
+                "comment_used": "",
+            }
+        if not isinstance(out, dict):
+            return {
+                "entry_result": None,
+                "attempts": [],
+                "last_error": ("bad_return_type", type(out).__name__),
+                "requested_lots": 0.0,
+                "requested_price": eff_px,
+                "comment_used": "",
+            }
+        # ensure required keys exist
+        out.setdefault("attempts", [])
+        out.setdefault("requested_price", eff_px)
+        out.setdefault("requested_lots", 0.0)
+        out.setdefault("comment_used", "")
+        return out
+    except Exception as e:
+        return {
+            "entry_result": None,
+            "attempts": [],
+            "last_error": ("exception", repr(e)),
+            "requested_lots": 0.0,
+            "requested_price": eff_px,
+            "comment_used": "",
+        }
+
+
 def _force_test_entry_if_requested(now: datetime):
     if not bool(CONFIG.get("force_test_entry", False)):
         return
     try:
         symbol = str(CONFIG.get("symbol", "XAUUSD"))
-        _, ask = fetch_tick(symbol)
+        bid, ask = fetch_tick(symbol)
         sd = _struct_stop(float(CONFIG.get("zone_width_usd", 5.0)))
-        order = send_market_order("BUY", ask, sd, trigger_price=ask)
+        eff = _effective_entry_price("BUY", ask, bid, ask)  # parity with live
+        order = _send_order_safe("BUY", eff, sd, trig=ask)
 
         _dump_attempts("TEST", order, now)
 
@@ -103,19 +176,19 @@ def _force_test_entry_if_requested(now: datetime):
         ticket = getattr(res, "order", None)
         ok = rc in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED)
 
+        ok_att = next(
+            (a for a in order.get("attempts", [])
+             if a.get("send_retcode") in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED)),
+            None
+        )
+        ok_fill = ok_att.get("filling") if ok_att else "?"
+
         if ok:
-            ok_att = next(
-                (a for a in order.get("attempts", [])
-                 if a.get("send_retcode") in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED)),
-                None
-            )
-            ok_fill = ok_att.get("filling") if ok_att else "?"
             print(f"{now} → TEST order OK  retcode={rc} ticket={ticket} "
                   f"price={order['requested_price']:.2f} lots={order['requested_lots']} "
                   f"filling={ok_fill} comment='{order.get('comment_used')}'")
         else:
             print(f"{now} → TEST order FAILED  retcode={rc} (expected DONE/PLACED)")
-            _dump_attempts("TEST", order, now)
             _print_last_error("TEST", now)
     except Exception as e:
         print(f"{now} → TEST order EXCEPTION: {e}")
@@ -133,10 +206,16 @@ def main_loop():
     print("Starting live session loop...")
     _print_env_caps("[env]")
 
+    # Tell us which module we pulled send_market_order from (helps spot stale imports)
+    try:
+        print(f"[env] entry.send_market_order from module: {getattr(send_market_order, '__module__', '?')}")
+    except Exception:
+        pass
+
     # --- Initial zone load ---
     try:
-        zones = get_today_zones()
-        zones = pd.DataFrame() if zones is None else zones.reset_index(drop=True)
+        z = get_today_zones()
+        zones = pd.DataFrame() if z is None else z.reset_index(drop=True)
     except Exception as e:
         print(f"[{now_utc()}] Initial zone load failed: {e}")
         zones = pd.DataFrame()
@@ -149,10 +228,15 @@ def main_loop():
     triggered_keys: set[tuple[datetime, str]] = set()
     min_delay = int(CONFIG.get("entry_min_delay_minutes", 0))
 
-    # Daily loss-limit
+    # Daily throughput control
     day_date = None
     day_start_equity = None
     loss_cut = float(CONFIG.get("day_loss_limit_pct", 0.05))
+    max_per_day = int(CONFIG.get("max_signals_per_day", 1))
+    both_sides = bool(CONFIG.get("both_sides_per_day", True))
+    day_fills = 0
+    did_buy = False
+    did_sell = False
 
     while True:
         now = now_utc()
@@ -166,8 +250,11 @@ def main_loop():
             day_start_equity = float(getattr(ai, "equity", 0.0)) if ai else None
             day_date = now.date()
             triggered_keys.clear()
+            day_fills = 0
+            did_buy = did_sell = False
             try:
-                zones = get_today_zones().reset_index(drop=True)
+                z = get_today_zones()
+                zones = pd.DataFrame() if z is None else z.reset_index(drop=True)
             except Exception as e:
                 print(f"[{now}] Zone refresh (new UTC day) failed: {e}")
                 zones = pd.DataFrame()
@@ -177,9 +264,9 @@ def main_loop():
         # Intraday zone refresh
         if (now - last_zone_refresh).total_seconds() >= refresh_secs:
             try:
-                new = get_today_zones().reset_index(drop=True)
-                if not new.empty:
-                    zones = new
+                new = get_today_zones()
+                if new is not None and not new.empty:
+                    zones = new.reset_index(drop=True)
                     print(f"[{now}] Refreshed zones intraday: {len(zones)}")
                 else:
                     print(f"[{now}] Intraday refresh: no zones.")
@@ -209,8 +296,17 @@ def main_loop():
         # Try entries
         if allow_entries and bid is not None and ask is not None and not zones.empty:
             for _, z in zones.iterrows():
-                sig_time = z.datetime.to_pydatetime() if hasattr(z.datetime, "to_pydatetime") else z.datetime
-                key = (pd.Timestamp(sig_time).to_pydatetime(), str(z.direction))
+                # Throughput cap: stop after max_per_day
+                if day_fills >= max_per_day:
+                    break
+                # Respect one-side-per-day if both_sides is False
+                if (z.direction == "BUY" and did_buy and not both_sides) or \
+                   (z.direction == "SELL" and did_sell and not both_sides):
+                    continue
+
+                # --- normalize signal time to naive UTC to avoid tz compare crash ---
+                sig_time = _as_naive_utc(z.datetime)
+                key = (sig_time, str(z.direction))
 
                 if key in triggered_keys:
                     continue
@@ -233,30 +329,28 @@ def main_loop():
                     continue
 
                 stop_dist = _robust_stop(z)
+                eff_px = _effective_entry_price(z.direction, trig, bid, ask)
 
-                try:
-                    order = send_market_order(
-                        z.direction,
-                        ask if z.direction == "BUY" else bid,
-                        stop_dist,
-                        trigger_price=trig
-                    )
-                except Exception as e:
-                    print(f"{now} → Order send EXCEPTION: {e}")
-                    _print_last_error("LIVE order", now)
-                    continue
+                order = _send_order_safe(
+                    z.direction,
+                    eff_px,                 # parity with backtest for sizing + SL/TP
+                    stop_dist,
+                    trig=trig
+                )
+
+                _dump_attempts("LIVE order", order, now)
 
                 res = order.get("entry_result")
                 if res is None:
                     print(f"{now} → LIVE order FAILED: entry_result=None  last_error={order.get('last_error')}")
-                    _dump_attempts("LIVE order", order, now)
                     _print_last_error("LIVE order", now)
                     continue
 
                 rc  = getattr(res, "retcode", None)
                 ticket = getattr(res, "order", None)
 
-                ok_att = next((a for a in order.get("attempts", []) if a.get("send_retcode") in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED)), None)
+                ok_att = next((a for a in order.get("attempts", [])
+                               if a.get("send_retcode") in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED)), None)
                 ok_fill = ok_att.get("filling") if ok_att else "?"
 
                 if rc in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED):
@@ -264,9 +358,7 @@ def main_loop():
                           f"price={order['requested_price']:.2f} lots={order['requested_lots']} "
                           f"filling={ok_fill} comment='{order.get('comment_used')}'")
                 else:
-                    # Rare branch; res exists but not OK → log attempts anyway
                     print(f"{now} → LIVE order NOT OK  retcode={rc}")
-                    _dump_attempts("LIVE order", order, now)
                     _print_last_error("LIVE order", now)
                     continue
 
@@ -279,6 +371,12 @@ def main_loop():
                 })
 
                 triggered_keys.add(key)
+                # Mark daily usage
+                day_fills += 1
+                if z.direction == "BUY":
+                    did_buy = True
+                else:
+                    did_sell = True
 
         else:
             if not in_session:
@@ -293,7 +391,10 @@ def main_loop():
         try:
             closed_trades = manage_all_trades()
             for trade in closed_trades:
-                write_trade_to_csv(trade)
+                try:
+                    write_trade_to_csv(trade)
+                except Exception as e:
+                    print(f"{now} → CSV log error: {e}  row={trade}")
                 print(f"{trade['exit_time']} → Trade closed: {trade['exit_reason']}")
         except Exception as e:
             print(f"{now} → Trade management error: {e}")

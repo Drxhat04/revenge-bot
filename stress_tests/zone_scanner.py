@@ -1,11 +1,18 @@
 #!/usr/bin/env python
 """
-XAUUSD OB / Liquidity-Sweep Scanner (v3.2, UTC-native, precomputed + cached)
-----------------------------------------------------------------------------
-• Precompute once: M15 bars, H1 bars + EMA(H1), 15m TR→ATR (for buffers)
-• Cache per-session hi/lo/buffer (no repeated resample inside loops)
-• Emit-time de-dup across overlapping sessions
-• No look-ahead; signals timestamped at next 15m open (UTC)
+Enhanced XAUUSD OB / Liquidity-Sweep Scanner (v3.1.3, UTC-native, no look-ahead)
+------------------------------------------------------------------------------
+• All timestamps in UTC
+• Confirms pierce/FVG on 15m bar 'c' and timestamps signal at next 15m open
+• Strict OB option: displacement-validated order block selection
+• Dynamic sweep buffer: USD / pct of session range / ATR / auto
+• Optional M1 micro BOS confirmation into the band
+• Optional H1 EMA bias gate
+• Skips Saturday / Sunday data
+• Allows multiple signals per day and both sides per day via config:
+    - max_signals_per_day: int (default 3, clamped to >=1)
+    - both_sides_per_day:  bool (default True)
+• NEW: dedup at emit-time to prevent duplicates across overlapping sessions
 """
 
 from __future__ import annotations
@@ -13,12 +20,13 @@ import pathlib, warnings, yaml, pandas as pd
 import numpy as np
 import datetime as _dt
 
-# ── Config ─────────────────────────────────────────────────────
+# ── Config ───────────────────────────────────────────────────────────────
 CFG                 = yaml.safe_load(open("config.yaml", "r", encoding="utf-8"))
 ZONE_W              = float(CFG["zone_width_usd"])
 BUFFER_USD          = float(CFG.get("sweep_buffer_usd", 0.05))
 ASIA_START          = CFG.get("asia_start", "18:00")
 ASIA_END            = CFG.get("asia_end",   "09:00")
+TOKYO_ONLY          = bool(CFG.get("tokyo_only", False))
 REQUIRE_PIERCE      = bool(CFG.get("require_pierce", True))
 REQUIRE_FVG         = bool(CFG.get("require_fvg",    True))
 DEBUG_DAYS          = int(CFG.get("debug_days",     0))
@@ -46,7 +54,7 @@ M1_BOS_LOOKBACK_MIN = int(CFG.get("m1_bos_lookback_min", 10))
 USE_H1_BIAS         = bool(CFG.get("use_h1_bias", False))
 H1_EMA_LEN          = int(CFG.get("h1_ema_len", 50))
 
-# ── Helpers ────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────
 def _td(val) -> pd.Timedelta:
     if isinstance(val, pd.Timedelta): return val
     if isinstance(val, _dt.timedelta): return pd.to_timedelta(val)
@@ -63,7 +71,6 @@ def _utc(ts) -> pd.Timestamp:
 
 START_TD, END_TD = _td(ASIA_START), _td(ASIA_END)
 
-# ── IO ─────────────────────────────────────────────────────────
 def load_m1(folder: str = "data") -> pd.DataFrame:
     files = sorted(pathlib.Path(folder).glob("XAUUSD_M1_*.csv"))
     if not files:
@@ -88,33 +95,6 @@ def load_m1(folder: str = "data") -> pd.DataFrame:
     ])
     return m1
 
-# ── Precompute globals (built once) ────────────────────────────
-M1 = None               # full M1
-M1I = None              # M1 indexed by time
-M15 = None              # 15m OHLC
-TR15 = None             # 15m TR (mean of M1 TR)
-ATR15 = None            # 15m ATR (rolling mean of TR15)
-H1 = None               # H1 OHLC
-EMA_H1 = None           # H1 EMA(close)
-
-def _precompute(m1: pd.DataFrame):
-    global M1, M1I, M15, TR15, ATR15, H1, EMA_H1
-    M1 = m1
-    M1I = M1.set_index("time")
-    # 15m OHLC & TR/ATR
-    M15 = (M1I.resample("15min")
-           .agg({"open":"first","high":"max","low":"min","close":"last"})
-           .dropna()
-           .reset_index())
-    TR15 = (M1I["tr"].resample("15min").mean())
-    ATR15 = TR15.rolling(14, min_periods=1).mean()
-    # H1 OHLC & EMA
-    H1 = (M1I.resample("1H")
-          .agg({"open":"first","high":"max","low":"min","close":"last"})
-          .dropna())
-    EMA_H1 = H1["close"].ewm(span=H1_EMA_LEN, adjust=False).mean()
-
-# ── Logic bits (now use precomputed) ───────────────────────────
 def fvg_ok(prev: pd.Series, cur: pd.Series, side: str) -> bool:
     if not REQUIRE_FVG: return True
     return (cur.low > prev.high) if side == "BUY" else (prev.low > cur.high)
@@ -123,6 +103,31 @@ def last_opposite(df15: pd.DataFrame, idx: int, side: str) -> pd.Series:
     mask = (df15.close < df15.open) if side == "BUY" else (df15.close > df15.open)
     sub  = df15.loc[: idx - 1][mask]
     return sub.iloc[-1] if not sub.empty else df15.iloc[idx - 1]
+
+def _session_windows_for(date_utc: pd.Timestamp) -> list[tuple[str, pd.Timestamp, pd.Timestamp]]:
+    boxes = CFG.get("session_boxes", [])
+    out = []
+    for b in boxes:
+        s = _td(b["start"]); e = _td(b["end"])
+        start = (date_utc - pd.Timedelta(days=1) + s) if s > e else (date_utc + s)
+        end   = date_utc + e
+        out.append((b.get("name","BOX"), start, end))
+    if not out:
+        start = date_utc - pd.Timedelta(days=1) + START_TD
+        end   = date_utc + END_TD
+        out = [("ASIA", start, end)]
+    return out
+
+def _dyn_buffer(sess_df_m1: pd.DataFrame) -> float:
+    rng = float(sess_df_m1.high.max() - sess_df_m1.low.min()) if not sess_df_m1.empty else 0.0
+    tr15 = (sess_df_m1.set_index("time")["tr"].resample("15min").mean())
+    atr15_series = tr15.rolling(14).mean()
+    atr15 = float(atr15_series.iloc[-1]) if len(atr15_series) and not np.isnan(atr15_series.iloc[-1]) else 0.0
+    if BUFFER_MODE == "usd": buf = BUFFER_USD
+    elif BUFFER_MODE == "pct": buf = BUFFER_PCT * rng
+    elif BUFFER_MODE == "atr": buf = BUFFER_ATR_MULT * atr15
+    else: buf = max(BUFFER_USD, BUFFER_PCT * rng, BUFFER_ATR_MULT * atr15)  # auto
+    return float(max(MIN_BUFFER_USD, min(buf, MAX_BUFFER_USD)))
 
 def _strict_ob(df15: pd.DataFrame, idx: int, side: str) -> pd.Series:
     if not STRICT_OB:
@@ -153,83 +158,47 @@ def _strict_ob(df15: pd.DataFrame, idx: int, side: str) -> pd.Series:
     opp = seg.iloc[:disp_idx][opp_mask]
     return opp.iloc[-1] if not opp.empty else last_opposite(df15, idx, side)
 
-def _m1_bos_ok(signal_time: pd.Timestamp, side: str) -> bool:
+def _m1_bos_ok(m1: pd.DataFrame, signal_time: pd.Timestamp, side: str) -> bool:
     if not USE_M1_BOS: return True
     start = signal_time - pd.Timedelta(minutes=M1_BOS_LOOKBACK_MIN)
-    win = M1I.loc[start:signal_time]
+    win = m1[(m1.time >= start) & (m1.time <= signal_time)]
     if win.empty: return True
     if side == "BUY":
-        return bool(win["high"].max() > (win["high"].iloc[-2] if len(win) >= 2 else win["high"].iloc[-1]))
+        return bool(win.high.max() > (win.high.iloc[-2] if len(win) >= 2 else win.high.iloc[-1]))
     else:
-        return bool(win["low"].min() < (win["low"].iloc[-2] if len(win) >= 2 else win["low"].iloc[-1]))
+        return bool(win.low.min() < (win.low.iloc[-2] if len(win) >= 2 else win.low.iloc[-1]))
 
-def _h1_bias_allows(confirm_time: pd.Timestamp, side: str) -> bool:
+def _h1_bias_allows(m1: pd.DataFrame, confirm_time: pd.Timestamp, side: str) -> bool:
     if not USE_H1_BIAS: return True
+    h1 = (m1.set_index("time").resample("1H")
+            .agg({"open":"first","high":"max","low":"min","close":"last"}).dropna())
+    if h1.empty or len(h1) < H1_EMA_LEN + 1: return True
+    ema = h1["close"].ewm(span=H1_EMA_LEN, adjust=False).mean()
     try:
-        idx = H1.index.get_indexer([confirm_time], method="pad")[0]
-        if idx == -1: return True
+        idxer = h1.index.get_indexer([confirm_time], method="pad")
+        if len(idxer) == 0 or idxer[0] == -1: return True
+        bar_idx = idxer[0]
     except Exception:
         return True
-    price = H1["close"].iloc[idx]
-    ema   = EMA_H1.iloc[idx]
-    return bool((price > ema) if side == "BUY" else (price < ema))
-
-# sessions list
-def _session_windows_for(date_utc: pd.Timestamp) -> list[tuple[str, pd.Timestamp, pd.Timestamp]]:
-    boxes = CFG.get("session_boxes", [])
-    out = []
-    for b in boxes:
-        s = _td(b["start"]); e = _td(b["end"])
-        start = (date_utc - pd.Timedelta(days=1) + s) if s > e else (date_utc + s)
-        end   = date_utc + e
-        out.append((b.get("name","BOX"), start, end))
-    if not out:
-        start = date_utc - pd.Timedelta(days=1) + _td(ASIA_START)
-        end   = date_utc + _td(ASIA_END)
-        out = [("ASIA", start, end)]
-    return out
-
-# cache for per-session stats
-_SESS_CACHE: dict[tuple[pd.Timestamp, pd.Timestamp], tuple[float,float,float]] = {}
-
-def _sess_stats(win_start: pd.Timestamp, win_end: pd.Timestamp) -> tuple[float,float,float]:
-    """
-    Return (hi, lo, BUF) using cached results.
-    BUF uses global ATR15 via end-of-window value (no resample here).
-    """
-    key = (win_start, win_end)
-    if key in _SESS_CACHE:
-        return _SESS_CACHE[key]
-    seg = M1I.loc[win_start:win_end]
-    if seg.empty:
-        _SESS_CACHE[key] = (np.nan, np.nan, float(BUFFER_USD))
-        return _SESS_CACHE[key]
-    hi = float(seg["high"].max()); lo = float(seg["low"].min()); rng = hi - lo
-    # ATR15 at end of window
-    atr_end = float(ATR15.loc[:win_end].iloc[-1]) if len(ATR15.loc[:win_end]) else 0.0
-    if BUFFER_MODE == "usd":
-        buf = BUFFER_USD
-    elif BUFFER_MODE == "pct":
-        buf = BUFFER_PCT * rng
-    elif BUFFER_MODE == "atr":
-        buf = BUFFER_ATR_MULT * atr_end
-    else:
-        buf = max(BUFFER_USD, BUFFER_PCT * rng, BUFFER_ATR_MULT * atr_end)
-    buf = max(MIN_BUFFER_USD, min(buf, MAX_BUFFER_USD))
-    _SESS_CACHE[key] = (hi, lo, float(buf))
-    return _SESS_CACHE[key]
+    price = h1["close"].iloc[bar_idx]
+    return bool((price > ema.iloc[bar_idx]) if side == "BUY" else (price < ema.iloc[bar_idx]))
 
 def _sig_key(ts: pd.Timestamp, direction: str, lo: float, hi: float) -> tuple:
-    return (_utc(ts), direction, round(lo, 2), round(hi, 2))
+    """Key used to dedup across overlapping sessions; round to cents."""
+    return (pd.Timestamp(ts).tz_convert("UTC"), direction, round(lo, 2), round(hi, 2))
 
-# ── Core scan ──────────────────────────────────────────────────
-def scan() -> pd.DataFrame:
+# ── Core scan ─────────────────────────────────────────────────────────────
+def scan(m1: pd.DataFrame) -> pd.DataFrame:
+    m15 = (m1.set_index("time")
+              .resample("15min").agg({"open":"first","high":"max","low":"min","close":"last"})
+              .dropna().reset_index())
+
     signals = []
-    emitted = set()
+    emitted = set()  # NEW: prevent duplicates across sessions
     dbg_left = DEBUG_DAYS
 
-    for date, day15 in M15.groupby(M15.time.dt.date):
-        if pd.Timestamp(date, tz="UTC").weekday() >= 5:
+    for date, day15 in m15.groupby(m15.time.dt.date):
+        if pd.Timestamp(date, tz="UTC").weekday() >= 5:  # skip Sat/Sun
             continue
 
         d0 = pd.Timestamp(date, tz="UTC")
@@ -243,16 +212,20 @@ def scan() -> pd.DataFrame:
             if made_today >= MAX_PER_DAY:
                 break
 
-            hi, lo, BUF = _sess_stats(win_start, win_end)
-            if np.isnan(hi) or np.isnan(lo):
+            sess = m1[(m1.time >= win_start) & (m1.time < win_end)]
+            if sess.empty:
                 continue
 
+            hi, lo = float(sess.high.max()), float(sess.low.min())
+            BUF = _dyn_buffer(sess)
+
             if dbg_left:
-                print(f"{date} [{sess_name}] hi={hi:.2f} lo={lo:.2f} buf={BUF:.2f}")
+                print(f"{date} [{sess_name}] hi={hi:.2f} lo={lo:.2f} buf={BUF:.2f} rows={len(sess)}")
 
             for i in range(1, len(day15)):
                 if made_today >= MAX_PER_DAY:
                     break
+
                 p, c = day15.iloc[i - 1], day15.iloc[i]
 
                 denom = p.close if p.close != 0 else 1.0
@@ -268,11 +241,12 @@ def scan() -> pd.DataFrame:
                     if ob_hi > ob_lo:
                         confirm_time = _utc(c.time) + pd.Timedelta(minutes=15)
                         k = _sig_key(confirm_time, "BUY", ob_lo, ob_hi)
-                        if k not in emitted and _m1_bos_ok(confirm_time, "BUY") and _h1_bias_allows(confirm_time, "BUY"):
+                        if k not in emitted and _m1_bos_ok(m1, confirm_time, "BUY") and _h1_bias_allows(m1, confirm_time, "BUY"):
                             signals.append([confirm_time, "BUY", ob_lo, ob_hi, np.nan, ob.time, c.time])
                             emitted.add(k)
                             did_buy = True
                             made_today += 1
+                            # allow SELL in same bar if ALLOW_BOTH_SIDES
 
                 # SELL
                 sell_pierce = bool(c.high > hi + BUF)
@@ -282,7 +256,7 @@ def scan() -> pd.DataFrame:
                     if ob_hi > ob_lo:
                         confirm_time = _utc(c.time) + pd.Timedelta(minutes=15)
                         k = _sig_key(confirm_time, "SELL", ob_lo, ob_hi)
-                        if k not in emitted and _m1_bos_ok(confirm_time, "SELL") and _h1_bias_allows(confirm_time, "SELL"):
+                        if k not in emitted and _m1_bos_ok(m1, confirm_time, "SELL") and _h1_bias_allows(m1, confirm_time, "SELL"):
                             signals.append([confirm_time, "SELL", ob_lo, ob_hi, np.nan, ob.time, c.time])
                             emitted.add(k)
                             did_sell = True
@@ -298,21 +272,18 @@ def scan() -> pd.DataFrame:
     )
     if not zones.empty:
         zones["datetime"] = pd.to_datetime(zones["datetime"], utc=True)
+        # Final belt-and-suspenders: drop any exact dup rows
         zones = zones.drop_duplicates(subset=["datetime","direction","entry_low","entry_high"], keep="first")
     return zones
 
-# ── CLI ────────────────────────────────────────────────────────
+# ── CLI wrapper ───────────────────────────────────────────────────────────
 def main() -> None:
     warnings.filterwarnings("ignore")
     print("Loading M1 data (UTC)")
     m1 = load_m1()
     print(f"Loaded rows: {len(m1):,}")
-
-    print("Precomputing frames (15m, H1, ATR15) …")
-    _precompute(m1)
-
     print("Scanning for sweep-OB zones in UTC (no look-ahead)")
-    zones = scan()
+    zones = scan(m1)
     if zones.empty:
         print("No zones found with current config.")
         return
@@ -320,28 +291,34 @@ def main() -> None:
     zones["zone_width"] = zones.entry_high - zones.entry_low
     zones["entry_mid"]  = (zones.entry_low + zones.entry_high) / 2
 
-    # Post-scan minute gap filter (cheap with indexed M1)
+    # Post-scan minute gap filter
     valid = []
-    m1i = M1I  # already indexed
-    def _match_bar(ts: pd.Timestamp) -> pd.Series | None:
+    m1i = m1.set_index("time")
+
+    def _match_bar(ts: pd.Timestamp) -> pd.DataFrame:
         try:
             exact = m1i.loc[ts:ts]
-            if not exact.empty: return exact.iloc[0]
-        except Exception: pass
+            if not exact.empty: return exact.iloc[0:1]
+        except Exception:
+            pass
         win = m1i.loc[ts - pd.Timedelta(seconds=60): ts + pd.Timedelta(seconds=60)]
-        if win.empty: return None
-        pos = win.index.get_indexer([ts], method="nearest")[0] if len(win) else 0
-        return win.iloc[pos]
+        if win.empty: return win
+        try:
+            pos = win.index.get_indexer([ts], method="nearest")[0]
+        except Exception:
+            delta_ns = (win.index - ts).asi8
+            pos = int(np.argmin(np.abs(delta_ns)))
+        return win.iloc[[pos]]
 
     for _, row in zones.iterrows():
         bar = _match_bar(row.datetime)
-        if bar is None:
+        if bar.empty:
             valid.append(row); continue
-        prev_loc = m1i.index.get_indexer([bar.name], method="pad")[0] - 1
-        if prev_loc >= 0:
-            prev_close = float(m1i.iloc[prev_loc].close)
+        prev_idx = m1i.index.get_indexer([bar.index[0]], method="pad")[0] - 1
+        if prev_idx >= 0:
+            prev_close = float(m1i.iloc[prev_idx].close)
             denom = prev_close if prev_close else 1.0
-            gap_ok = abs(float(bar.open) - prev_close) / abs(denom) <= GAP_FILTER
+            gap_ok = abs(float(bar["open"].values[0]) - prev_close) / abs(denom) <= GAP_FILTER
             if gap_ok: valid.append(row)
         else:
             valid.append(row)

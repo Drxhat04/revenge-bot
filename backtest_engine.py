@@ -1,10 +1,13 @@
 #!/usr/bin/env python
 # ────────────────────────────────────────────────────────────────
-# backtest_engine.py · v10.1
+# backtest_engine.py · v10.5
 #  • Band-trigger entries + configurable depth + fill-price policy
 #  • Enforce minimum delay after signal (no same-minute fills)
 #  • Robust stops: max(structural, ATR) when dynamic_stops is on
 #  • Proper cost accounting and audit fields
+#  • Margin stop — stop the whole BT when balance ≤ floor
+#  • Configurable BE-after-TP1 + TP3/TP4 with extra units
+#  • NEW: Single-target mode (route 100% to TP1/2/3/4; one-entry intent)
 # ────────────────────────────────────────────────────────────────
 
 from __future__ import annotations
@@ -20,17 +23,37 @@ DEFAULTS = {
     "risk_mult": 2.3,
     "tp1_mult": 0.68,
     "tp2_mult": 1.16,
+    # NEW: extra targets (off by default)
+    "tp3_mult": 1.80,
+    "tp4_mult": 2.40,
+    "use_tp3": False,
+    "use_tp4": False,
+    "extra_split_across_tp3_tp4": False,   # if True and TP4 enabled: half extra at TP3, half at TP4
     "risk_per_trade": 0.02,
     "max_risk_ratio": 0.03,
+
+    # Units (exposure weights in “units”, not lots)
+    "main_units": 1.0,           # TP1
+    "runner_units": 0.5,         # TP2
+    "extra_runner_units": 0.5,   # TP3/TP4
+
+    # Management
+    "be_after_tp1": True,        # original behavior; set False to keep SL where it was
 
     # Volatility stops
     "dynamic_stops": True,
     "atr_multiplier": 3.0,
-    "min_stop_usd": 1.0,
+    "min_stop_usd": 1.0,        # absolute hard floor for stops used in sizing
 
     # Timeouts
     "no_touch_timeout_hours": 3,
     "force_close_hours": 24,
+
+    "force_close_policy": "final_close",  # "final_close" | "tp2" | "tp1"
+    "max_extension_hours": None,          # None = unlimited; or an int cap (e.g., 72)
+    "grace_hours": 0,                     # hours after hardcut to keep aiming for the original TP
+    "overtime_sl_mode": "none",           # "none" | "to_entry" | "tighten_to_half"
+
 
     # Lot sizing
     "min_lot_size": 0.01,
@@ -41,7 +64,7 @@ DEFAULTS = {
     "tick_size": 0.0,                     # zero-spread account
     "slip_usd_side_lot": 5.0,
     "use_csv_spread": False,
-    "commission_per_lot_per_side": 5.5,  # override via config (e.g., 5.5)
+    "commission_per_lot_per_side": 5.5,
 
     # Slippage scaling
     "slippage_scale_threshold_lots": 2.0,
@@ -62,24 +85,26 @@ DEFAULTS = {
     "day_loss_limit_pct": 0.05,
 
     # Leverage / margin
-    "leverage": 500.0,  # e.g. 1:500 for zero account
+    "leverage": 500.0,
 
     # Equity
     "start_balance": 10_000.0,
 
-    # ───────── Entry logic ─────────
-    # Trigger type: "band" uses half-zone entry bands, "mid" requires midpoint touch
-    "entry_trigger": "band",
-    # Band sides: BUY default band [mid, high]; SELL default band [low, mid]
-    "band_side_buy": "upper",  # "upper" -> [mid, high], "lower" -> [low, mid]
-    "band_side_sell": "lower",  # "lower" -> [low, mid], "upper" -> [mid, high]
-    # Depth into band to trigger a fill: 0.00 = band edge at mid, 0.50 = halfway, 1.00 = far edge
-    "band_entry_threshold": 0.00,
-    # Fill price policy: "threshold" (deterministic) or "touch" (bar's tradeable side)
-    "band_fill_price": "threshold",
-
-    # Realism: prevent same-minute fills after the signal timestamp
+    # ENTRY LOGIC
+    "entry_trigger": "band",      # "band" | "mid"
+    "band_side_buy": "upper",
+    "band_side_sell": "lower",
+    "band_entry_threshold": 0.00, # 0..1 inside chosen band
+    "band_fill_price": "threshold",  # "threshold" | "touch"
     "entry_min_delay_minutes": 1,
+
+    # ── Margin stop controls
+    "stop_on_negative_balance": True,
+    "min_equity_usd": 0.0,
+
+    # ── Single-target mode
+    "force_single_entry": False,   # when True, route 100% to one TP
+    "single_entry_target": None,   # None or 1..4
 }
 
 # ╭─ CONFIG LOAD (used only if caller passes nothing) ───────────╮
@@ -88,7 +113,6 @@ def load_cfg(path: str | Path = "config.yaml") -> dict:
     if Path(path).exists():
         user_cfg = yaml.safe_load(open(path)) or {}
         cfg.update(user_cfg)
-    # alias for lot cap
     cfg["lot_cap"] = cfg.get("max_lots", DEFAULTS["max_lots"])
     return cfg
 # ╰──────────────────────────────────────────────────────────────╯
@@ -126,22 +150,29 @@ def is_near_swap_cutoff(signal_time: datetime, cfg: dict) -> bool:
 # ╭─ RISK-BASED LOT SIZING w/ leverage cap ──────────────────────╮
 def calculate_position_size(cfg: dict, balance: float,
                              stop_distance: float, price: float) -> float:
-    stop_distance = max(stop_distance, cfg.get("min_stop_usd", 0))
+    if balance <= 0:
+        return 0.0
+
+    stop_distance = max(stop_distance, cfg.get("min_stop_usd", 0.0))
     dollar_risk = cfg["risk_per_trade"] * balance
     dollar_risk = min(dollar_risk, cfg["max_risk_ratio"] * balance)
+    if dollar_risk <= 0 or stop_distance <= 0:
+        return 0.0
+
     risk_per_lot = stop_distance * cfg["dollar_per_unit_per_lot"]
     lots = dollar_risk / risk_per_lot if risk_per_lot > 0 else 0.0
 
     # enforce leverage cap
     margin_per_lot = price * cfg["dollar_per_unit_per_lot"] / cfg["leverage"]
-    max_lots_by_margin = balance / margin_per_lot if margin_per_lot > 0 else lots
-    lots = min(lots, max_lots_by_margin)
+    if margin_per_lot > 0:
+        max_lots_by_margin = balance / margin_per_lot
+        lots = min(lots, max_lots_by_margin)
 
     # cap, floor, quantize
     lots = min(lots, cfg["lot_cap"])
-    lots = max(lots, cfg["min_lot_size"])
+    lots = max(lots, cfg["min_lot_size"]) if lots > 0 else 0.0
     inc = cfg["lot_size_increment"]
-    return round(lots / inc) * inc
+    return round(lots / inc) * inc if lots > 0 else 0.0
 # ╰──────────────────────────────────────────────────────────────╯
 
 # ╭─ DEAL COSTS + commission ───────────────────────────────────╮
@@ -150,7 +181,6 @@ def pts_to_price(points: float, tick: float) -> float:
 
 def deal_cost(bars: pd.DataFrame, entry_ts, exit_ts,
               lots: float, cfg: dict) -> float:
-    # spread & slippage
     usd_spread_slip = 0.0
     if cfg.get("use_csv_spread", False) and "spread" in bars.columns:
         spr_in = pts_to_price(bars.loc[bars.time >= entry_ts, "spread"].iloc[0],
@@ -167,21 +197,14 @@ def deal_cost(bars: pd.DataFrame, entry_ts, exit_ts,
         usd_slip = (base_slip + extra) * 2 * lots
         usd_spread_slip = usd_spread + usd_slip
     else:
-        # zero spread → just slippage
         usd_spread_slip = cfg["slip_usd_side_lot"] * 2 * lots
 
-    # commission (entry + exit)
     comm = cfg["commission_per_lot_per_side"] * 2 * lots
-
     return usd_spread_slip + comm
 # ╰──────────────────────────────────────────────────────────────╯
 
-# ╭─ BAND HELPERS (new) ────────────────────────────────────────╮
+# ╭─ BAND HELPERS ───────────────────────────────────────────────╮
 def derive_band(sig, cfg: dict) -> tuple[float, float]:
-    """
-    Return (band_low, band_high) for this signal from precomputed columns
-    or by splitting the zone at its midpoint.
-    """
     bl = getattr(sig, "entry_band_low", np.nan)
     bh = getattr(sig, "entry_band_high", np.nan)
     if pd.notna(bl) and pd.notna(bh):
@@ -198,10 +221,6 @@ def derive_band(sig, cfg: dict) -> tuple[float, float]:
 
 
 def band_trigger_price(sig, cfg: dict) -> tuple[float, float, float]:
-    """
-    Compute the trigger price within the chosen band based on band_entry_threshold.
-    Returns (band_low, band_high, trigger_price).
-    """
     band_low, band_high = derive_band(sig, cfg)
     band_width = band_high - band_low
     if band_width <= 0:
@@ -227,14 +246,34 @@ def simulate_trade(sig: pd.Series, bars: pd.DataFrame,
         return {"filled": False, "reason": "swap_avoidance"}
 
     # Window (enforce minimum entry delay)
-    touch_to = sig.datetime + timedelta(hours=cfg["no_touch_timeout_hours"])
-    hardcut  = sig.datetime + timedelta(hours=cfg["force_close_hours"])
+    touch_to  = sig.datetime + timedelta(hours=cfg["no_touch_timeout_hours"])
+    hardcut   = sig.datetime + timedelta(hours=cfg["force_close_hours"])
     start_time = sig.datetime + timedelta(minutes=int(cfg.get("entry_min_delay_minutes", 0)))
-    look = bars[(bars.time >= start_time) & (bars.time <= hardcut)]
+
+    # Overtime policy and limits
+    policy = str(cfg.get("force_close_policy", "final_close")).lower()  # "final_close" | "tp2" | "tp1"
+    grace_hours = float(cfg.get("grace_hours", 0.0) or 0.0)
+    # end of grace (we still aim for original targets up to here)
+    grace_end = hardcut + timedelta(hours=grace_hours)
+
+    # overall end time bound (grace + max extension) for performance control
+    max_ext = cfg.get("max_extension_hours", None)
+    if policy in ("tp1", "tp2"):
+        if max_ext is None:
+            # no hard cap → we still bound by data end for performance
+            end_time = bars["time"].max()
+        else:
+            end_time = grace_end + timedelta(hours=float(max_ext))
+        # bounded scan
+        look = bars[(bars.time >= start_time) & (bars.time <= end_time)]
+    else:
+        # legacy bounded scan
+        look = bars[(bars.time >= start_time) & (bars.time <= hardcut)]
+
     if look.empty:
         return {"filled": False, "reason": "no_entry_data"}
 
-    # Decide trigger
+    # Trigger
     mode = cfg.get("entry_trigger", "band")
     if mode == "mid":
         band_low, band_high, trigger_price = float(sig.entry_mid), float(sig.entry_mid), float(sig.entry_mid)
@@ -249,15 +288,10 @@ def simulate_trade(sig: pd.Series, bars: pd.DataFrame,
     for i, b in enumerate(look.itertuples()):
         if b.time >= touch_to:
             break
-
         if mode == "mid":
             reached = (b.low <= trigger_price <= b.high)
         else:
-            if sig.direction == "BUY":
-                reached = (b.high >= trigger_price)  # hit or exceed price
-            else:
-                reached = (b.low <= trigger_price)
-
+            reached = (b.high >= trigger_price) if sig.direction == "BUY" else (b.low <= trigger_price)
         if reached:
             fill_idx = i
             fill_bar = b
@@ -274,67 +308,163 @@ def simulate_trade(sig: pd.Series, bars: pd.DataFrame,
 
     entry_time = fill_bar.time
 
-    # Stop distance and targets
+    # Stop & targets
     stop_distance = max(stop_distance, cfg.get("min_stop_usd", 0.0))
+
+    umain  = float(cfg.get("main_units", 1.0))
+    urun   = float(cfg.get("runner_units", 0.5))
+    uextra = float(cfg.get("extra_runner_units", 0.0))
+    use_tp3 = bool(cfg.get("use_tp3", False))
+    use_tp4 = bool(cfg.get("use_tp4", False))
+
+    # Pre-compute target prices + helpers
     if sig.direction == "BUY":
-        sl  = entry_price - stop_distance
+        sl0 = entry_price - stop_distance  # original SL snapshot for overtime math
+        sl  = sl0
         tp1 = entry_price + cfg["tp1_mult"] * stop_distance
         tp2 = entry_price + cfg["tp2_mult"] * stop_distance
-        hit_sl  = lambda br: bid_price(br) <= sl
-        hit_tp1 = lambda br: ask_price(br) >= tp1
-        hit_tp2 = lambda br: ask_price(br) >= tp2
+        tp3 = entry_price + (cfg.get("tp3_mult", 0.0) * stop_distance if use_tp3 else 0.0)
+        tp4 = entry_price + (cfg.get("tp4_mult", 0.0) * stop_distance if use_tp4 else 0.0)
+        price_ge = lambda br, p: ask_price(br) >= p
+        hit_sl   = lambda br: bid_price(br) <= sl
+        tighten_half = lambda curr_sl: max(curr_sl, entry_price - (stop_distance * 0.5))
         sign = 1
+        mk_px = lambda br: bid_price(br)  # MTM on exit for BUY
     else:
-        sl  = entry_price + stop_distance
+        sl0 = entry_price + stop_distance
+        sl  = sl0
         tp1 = entry_price - cfg["tp1_mult"] * stop_distance
         tp2 = entry_price - cfg["tp2_mult"] * stop_distance
-        hit_sl  = lambda br: ask_price(br) >= sl
-        hit_tp1 = lambda br: bid_price(br) <= tp1
-        hit_tp2 = lambda br: bid_price(br) <= tp2
+        tp3 = entry_price - (cfg.get("tp3_mult", 0.0) * stop_distance if use_tp3 else 0.0)
+        tp4 = entry_price - (cfg.get("tp4_mult", 0.0) * stop_distance if use_tp4 else 0.0)
+        price_ge = lambda br, p: bid_price(br) <= p   # inverted for SELL
+        hit_sl   = lambda br: ask_price(br) >= sl
+        tighten_half = lambda curr_sl: min(curr_sl, entry_price + (stop_distance * 0.5))
         sign = -1
+        mk_px = lambda br: ask_price(br)  # MTM on exit for SELL
+
+    hit_tp1 = (lambda br: price_ge(br, tp1))
+    hit_tp2 = (lambda br: price_ge(br, tp2))
+    hit_tp3 = (lambda br: price_ge(br, tp3)) if use_tp3 else (lambda br: False)
+    hit_tp4 = (lambda br: price_ge(br, tp4)) if use_tp4 else (lambda br: False)
 
     # Manage trade
     seq = look.iloc[fill_idx:]
     pnl_raw = 0.0
     tp1_hit = False
     tp2_hit = False
+    tp3_hit = False
+    tp4_hit = False
     exit_time = None
     exit_reason = None
-    main_u, run_u = 1.0, 0.5  # base + runner = 1.5x base units
+
+    be_after_tp1 = bool(cfg.get("be_after_tp1", True))
+
+    # remaining units
+    r_main  = umain
+    r_run   = urun
+    r_ex3   = uextra if use_tp3 and not use_tp4 else (0.0 if not use_tp3 else uextra)
+    r_ex4   = uextra if use_tp4 else 0.0
+    if use_tp3 and use_tp4:
+        pass  # keep caller's split behavior if any
+
+    # Overtime state
+    adjust_active = False     # when True, targets collapsed to adj_tp
+    adjust_to = None          # "tp1" or "tp2"
+    adj_tp = None
+    ext_deadline = None
+    if policy in ("tp1", "tp2"):
+        # Absolute deadline after grace (if capped)
+        if max_ext is not None:
+            ext_deadline = grace_end + timedelta(hours=float(max_ext))
 
     for b in seq.itertuples():
-        if b.time > hardcut:
-            px = bid_price(b) if sig.direction == "BUY" else ask_price(b)
-            pnl_raw += sign * (px - entry_price) * (main_u + run_u)
+        # Legacy policy: respect hardcut and exit at market
+        if policy == "final_close" and b.time > hardcut:
+            px = mk_px(b)
+            remaining_units = r_main + r_run + r_ex3 + r_ex4
+            pnl_raw += sign * (px - entry_price) * remaining_units
             exit_time, exit_reason = b.time, "force_close"
             break
 
-        if not tp1_hit and hit_tp1(b):
+        # If we do have a cap and it's exceeded → final_close_timeout
+        if ext_deadline is not None and b.time > ext_deadline:
+            px = mk_px(b)
+            remaining_units = r_main + r_run + r_ex3 + r_ex4
+            pnl_raw += sign * (px - entry_price) * remaining_units
+            exit_time, exit_reason = b.time, "final_close_timeout"
+            break
+
+        # PRIORITY: TPs fire before SL
+        if (r_main > 0) and hit_tp1(b):
             tp1_hit = True
-            pnl_raw += sign * (tp1 - entry_price) * main_u
-            main_u = 0.0
-            sl = entry_price  # BE after TP1
+            pnl_raw += sign * (tp1 - entry_price) * r_main
+            r_main = 0.0
+            if be_after_tp1:
+                sl = entry_price  # BE hop
 
-        if tp1_hit and hit_tp2(b):
+        if (r_run > 0) and hit_tp2(b):
             tp2_hit = True
-            pnl_raw += sign * (tp2 - entry_price) * run_u
-            exit_time, exit_reason = b.time, "tp2"
+            pnl_raw += sign * (tp2 - entry_price) * r_run
+            r_run = 0.0
+            if (r_ex3 + r_ex4) == 0.0 and not adjust_active:
+                exit_time, exit_reason = b.time, "tp2"
+                break
+
+        if (r_ex3 > 0) and hit_tp3(b):
+            tp3_hit = True
+            pnl_raw += sign * (tp3 - entry_price) * r_ex3
+            r_ex3 = 0.0
+            if r_ex4 == 0.0 and not adjust_active:
+                exit_time, exit_reason = b.time, "tp3"
+                break
+
+        if (r_ex4 > 0) and hit_tp4(b):
+            tp4_hit = True
+            pnl_raw += sign * (tp4 - entry_price) * r_ex4
+            r_ex4 = 0.0
+            exit_time, exit_reason = b.time, "tp4"
             break
 
-        if not tp1_hit and hit_sl(b):
-            pnl_raw += sign * (sl - entry_price) * (main_u + run_u)
-            exit_time, exit_reason = b.time, "sl"
-            break
+        # Activate "adjusted overtime" AFTER grace window expires
+        if (policy in ("tp1","tp2")) and (not adjust_active) and (b.time > grace_end):
+            adjust_active = True
+            adjust_to = policy
+            adj_tp = tp1 if policy == "tp1" else tp2
 
-        if tp1_hit and hit_sl(b):
-            exit_time, exit_reason = b.time, "be"
+            # SL tightening on switch
+            mode = str(cfg.get("overtime_sl_mode", "none")).lower()
+            if mode == "to_entry":
+                sl = entry_price
+            elif mode == "tighten_to_half":
+                sl = tighten_half(sl)
+            else:
+                pass  # "none": leave SL untouched
+
+        # If we are in adjusted overtime: one composite TP for all remaining units
+        if adjust_active:
+            remaining_units = r_main + r_run + r_ex3 + r_ex4
+            if remaining_units > 0 and price_ge(b, adj_tp):
+                pnl_raw += sign * (adj_tp - entry_price) * remaining_units
+                r_main = r_run = r_ex3 = r_ex4 = 0.0
+                exit_time, exit_reason = b.time, f"force_{adjust_to}"
+                break
+
+        # SL logic (always active)
+        if hit_sl(b):
+            remaining_units = r_main + r_run + r_ex3 + r_ex4
+            pnl_raw += sign * (sl - entry_price) * remaining_units
+            exit_time, exit_reason = b.time, ("be" if (be_after_tp1 and tp1_hit and sl == entry_price) else "sl")
             break
 
     if exit_time is None:
+        # Ran out of bars: MTM
         last = seq.iloc[-1]
-        px = bid_price(last) if sig.direction == "BUY" else ask_price(last)
-        pnl_raw += sign * (px - entry_price) * (main_u + run_u)
-        exit_time, exit_reason = last.time, "final_close"
+        px = mk_px(last)
+        remaining_units = r_main + r_run + r_ex3 + r_ex4
+        pnl_raw += sign * (px - entry_price) * remaining_units
+        exit_time = last.time
+        exit_reason = "final_close" if not adjust_active else f"force_{adjust_to}_eod"
 
     return {
         "filled": True,
@@ -344,6 +474,8 @@ def simulate_trade(sig: pd.Series, bars: pd.DataFrame,
         "pnl_raw": pnl_raw,
         "tp1_hit": tp1_hit,
         "tp2_hit": tp2_hit,
+        "tp3_hit": tp3_hit,
+        "tp4_hit": tp4_hit,
         "entry_price_used": entry_price,
         "trigger_price": trigger_price,
         "band_low": band_low,
@@ -358,13 +490,51 @@ def run_backtest(signals: pd.DataFrame, bars: pd.DataFrame,
                  trial_no: int|None=None) -> pd.DataFrame:
     cfg = load_cfg() if cfg is None else cfg
     balance = start_balance if start_balance is not None else cfg["start_balance"]
+    equity_floor = max(float(cfg.get("min_equity_usd", 0.0)), 0.0)
+    stop_on_neg = bool(cfg.get("stop_on_negative_balance", True))
+
+    # ── Single-target override (applied once at start)
+    st_on = bool(cfg.get("force_single_entry", False))
+    st_tp = cfg.get("single_entry_target", None)
+    if st_on and st_tp in (1, 2, 3, 4):
+        # Zero all first
+        cfg["main_units"] = 0.0
+        cfg["runner_units"] = 0.0
+        cfg["extra_runner_units"] = 0.0
+        # Disable BE-after-TP1 since TP1 may be unused
+        cfg["be_after_tp1"] = False
+        # Disable extra targets by default, then enable exactly one
+        cfg["use_tp3"] = False
+        cfg["use_tp4"] = False
+        if st_tp == 1:
+            cfg["main_units"] = 1.0
+        elif st_tp == 2:
+            cfg["runner_units"] = 1.0
+        elif st_tp == 3:
+            cfg["extra_runner_units"] = 1.0
+            cfg["use_tp3"] = True
+        elif st_tp == 4:
+            cfg["extra_runner_units"] = 1.0
+            cfg["use_tp4"] = True
+
     dollar_pt = cfg["dollar_per_unit_per_lot"]
     rows = []
     current_day = None
     start_bal_day = balance
     skip = False
+    early_stop = False
+
+    # cache units for portfolio-level lot allocation (after overrides)
+    umain  = float(cfg.get("main_units", 1.0))
+    urun   = float(cfg.get("runner_units", 0.5))
+    uextra = float(cfg.get("extra_runner_units", 0.0))
 
     for sig in signals.itertuples():
+        # Equity hard stop BEFORE considering the next trade
+        if stop_on_neg and balance <= equity_floor:
+            early_stop = True
+            break
+
         day = sig.datetime.date()
         if day != current_day:
             current_day = day
@@ -382,18 +552,21 @@ def run_backtest(signals: pd.DataFrame, bars: pd.DataFrame,
                 "filled": False,
                 "lot_main": 0.0,
                 "lot_runner": 0.0,
+                "lot_extra": 0.0,
                 "pnl": 0.0,
                 "swap_cost": 0.0,
                 "commission": 0.0,
+                "slippage_spread": 0.0,
+                "total_cost": 0.0,
                 "balance_after": balance,
             })
             continue
 
-        # Robust stop: take the larger of structural and ATR (if available)
+        # Robust stop: max(structural, ATR*mult) if available
         struct_stop = cfg["risk_mult"] * sig.zone_width
         atr_stop = None
-        if cfg.get("dynamic_stops", False) and getattr(sig, "atr", 0) > 0:
-            atr_stop = sig.atr * cfg["atr_multiplier"]
+        if cfg.get("dynamic_stops", False) and getattr(sig, "atr", 0) and not pd.isna(sig.atr):
+            atr_stop = float(sig.atr) * cfg["atr_multiplier"]
         stop = max(struct_stop, atr_stop) if atr_stop is not None else struct_stop
 
         res = simulate_trade(sig, bars, cfg, stop)
@@ -402,16 +575,37 @@ def run_backtest(signals: pd.DataFrame, bars: pd.DataFrame,
             "direction": sig.direction,
             "entry_mid": sig.entry_mid,
             "balance_before": balance,
-            **{k: res.get(k) for k in ("exit_time", "exit_reason", "tp1_hit", "tp2_hit", "filled",
-                                       "entry_price_used", "trigger_price")}
+            **{k: res.get(k) for k in (
+                "exit_time","exit_reason","tp1_hit","tp2_hit","tp3_hit","tp4_hit","filled",
+                "entry_price_used","trigger_price"
+            )}
         }
 
         if res.get("filled", False):
-            # lot sizing at actual fill price
+            # lot sizing at actual fill price — lot size per 1.0 “unit”
             price_for_sizing = res["entry_price_used"]
-            base_lot = calculate_position_size(cfg, balance, stop, price_for_sizing)
-            lot_runner = round(base_lot * 0.5, 3)
-            total_lots = base_lot + lot_runner
+            unit_lot = calculate_position_size(cfg, balance, stop, price_for_sizing)
+            if unit_lot <= 0:
+                row.update(
+                    filled=False,
+                    lot_main=0.0,
+                    lot_runner=0.0,
+                    lot_extra=0.0,
+                    pnl=0.0,
+                    swap_cost=0.0,
+                    commission=0.0,
+                    slippage_spread=0.0,
+                    total_cost=0.0,
+                    exit_reason="insufficient_margin",
+                )
+                row["balance_after"] = balance
+                rows.append(row)
+                continue
+
+            lot_main   = round(unit_lot * umain, 3)
+            lot_runner = round(unit_lot * urun, 3)
+            lot_extra  = round(unit_lot * uextra, 3)
+            total_lots = lot_main + lot_runner + lot_extra
 
             # costs
             total_cost = deal_cost(bars, res["entry_time"], res["exit_time"], total_lots, cfg)
@@ -420,17 +614,22 @@ def run_backtest(signals: pd.DataFrame, bars: pd.DataFrame,
 
             swap = calculate_swap_cost(res["entry_time"], res["exit_time"], sig.direction, total_lots, cfg)
 
-            # pnl_raw is USD-per-unit across exposures (1.5x); multiply by base_lot to size
-            pnl = res["pnl_raw"] * dollar_pt * base_lot - total_cost - swap
+            # pnl_raw is USD-per-unit across realized exposures; multiply by unit lot
+            pnl = res["pnl_raw"] * dollar_pt * unit_lot - total_cost - swap
             balance += pnl
 
             # daily loss check
             if balance - start_bal_day < -cfg["day_loss_limit_pct"] * start_bal_day:
                 skip = True
 
+            # margin stop AFTER trade
+            if stop_on_neg and balance <= equity_floor:
+                row["exit_reason"] = "margin_stop"
+
             row.update(
-                lot_main=base_lot,
+                lot_main=lot_main,
                 lot_runner=lot_runner,
+                lot_extra=lot_extra,
                 pnl=pnl,
                 swap_cost=swap,
                 commission=commission,
@@ -441,13 +640,24 @@ def run_backtest(signals: pd.DataFrame, bars: pd.DataFrame,
             row.update(
                 lot_main=0.0,
                 lot_runner=0.0,
+                lot_extra=0.0,
                 pnl=0.0,
                 swap_cost=0.0,
                 commission=0.0,
+                slippage_spread=0.0,
+                total_cost=0.0,
             )
 
         row["balance_after"] = balance
         rows.append(row)
 
-    return pd.DataFrame(rows)
+        # if margin stop triggered by this trade — stop processing further signals
+        if stop_on_neg and balance <= equity_floor:
+            early_stop = True
+            break
+
+    out = pd.DataFrame(rows)
+    if len(out) and early_stop:
+        out.attrs["early_stop_reason"] = "margin_stop"
+    return out
 # ╰──────────────────────────────────────────────────────────────╯
