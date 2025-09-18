@@ -521,9 +521,10 @@ def get_open_positions(symbol: str, magic: int):
         return []
     return [p for p in all_positions if int(getattr(p, "magic", 0)) == int(magic)]
 
-def manage_all_trades() -> List[dict]:
+def manage_all_trades(notifier=None) -> List[dict]:
     """
     Runs exit checks on all open bot trades. Closes or partially closes if needed.
+    If a notifier is provided, it updates the linked Telegram message.
     """
     symbol = CONFIG["symbol"]
     magic = int(CONFIG["magic"])
@@ -535,19 +536,32 @@ def manage_all_trades() -> List[dict]:
         direction = "BUY" if pos.type == mt5.ORDER_TYPE_BUY else "SELL"
         entry_price = float(pos.price_open)
 
-        # 1) Always infer stop distance first (guaranteed numeric)
         stop_dist = _infer_stop_distance(pos)
-
-        # 2) Then compute levels from entry, direction, and stop distance
         levels = calculate_levels(entry_price, direction, stop_dist)
 
         reason = check_exit_conditions(pos, levels)
         if not reason:
             continue
 
-        # Single-target or any terminal event → full close
+        # Terminal events → full close
         if reason in ("sl","tp2","tp3","tp4","force_close","final_close_timeout","swap_cutoff","force_tp1","force_tp2"):
+            # Hit notifications before sending close, to show which TP/SL was reached
+            try:
+                if notifier:
+                    if reason in ("tp2","force_tp2"): notifier.mark_tp_hit(int(pos.ticket), tp_idx=2, hit_price=float(levels.get("tp2") or entry_price))
+                    elif reason == "tp3": notifier.mark_tp_hit(int(pos.ticket), tp_idx=3, hit_price=float(levels.get("tp3") or entry_price))
+                    elif reason == "tp4": notifier.mark_tp_hit(int(pos.ticket), tp_idx=4, hit_price=float(levels.get("tp4") or entry_price))
+                    elif reason == "sl": notifier.mark_sl_hit(int(pos.ticket), hit_price=float(levels.get("sl") or entry_price))
+            except Exception:
+                pass
+
             res = close_position(pos, reason)
+            try:
+                if notifier and res.get("exit_ok", False):
+                    notifier.mark_closed(int(pos.ticket), reason=reason, exit_price=float(res.get("exit_price") or 0.0))
+            except Exception:
+                pass
+
             closed_logs.append({
                 "ticket": pos.ticket,
                 "symbol": symbol,
@@ -559,9 +573,16 @@ def manage_all_trades() -> List[dict]:
             })
             continue
 
-        # Legacy TP1 partial only if NOT single-target and BE-after-TP1 enabled
+        # Legacy TP1 partial with BE
         if reason == "tp1" and (not ST_ON) and BE_AFTER_TP1:
             part = partial_close_and_move_be(pos, MAIN_FRACTION_OF_TOTAL, be_price=entry_price, reason="tp1")
+            try:
+                if notifier and part.get("partial_ok", False):
+                    notifier.mark_partial(int(pos.ticket), lots_closed=float(pos.volume) * MAIN_FRACTION_OF_TOTAL, exit_price=float(part.get("partial_result", {}).get("price") or 0.0))
+                    notifier.mark_tp_hit(int(pos.ticket), tp_idx=1, hit_price=float(levels.get("tp1") or entry_price))
+            except Exception:
+                pass
+
             closed_logs.append({
                 "ticket": pos.ticket,
                 "symbol": symbol,
@@ -575,8 +596,12 @@ def manage_all_trades() -> List[dict]:
             continue
 
         if reason == "tp1_be":
-            # Move to BE without partial
             mod = _modify_position_sl_tp(symbol, int(pos.ticket), sl=_normalize_price(symbol, entry_price), tp=None)
+            try:
+                if notifier:
+                    notifier.mark_tp_hit(int(pos.ticket), tp_idx=1, hit_price=float(levels.get("tp1") or entry_price))
+            except Exception:
+                pass
             closed_logs.append({
                 "ticket": pos.ticket,
                 "symbol": symbol,

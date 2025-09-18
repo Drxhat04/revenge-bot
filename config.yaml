@@ -1,55 +1,77 @@
+# ===========================
 # === Session filter (UTC) — entry gating ===
+# ===========================
 sessions:
   - "00:00-09:00"   # Asian session
   - "07:00-16:00"   # London session
   - "12:00-21:00"   # New York session
 enforce_session_gating_in_backtest: true   # mirror live gating when backtesting
 
+# ===========================
 # === Session boxes used by the SCANNER (scan all, not just Asia) ===
+# ===========================
 session_boxes:
   - { name: "ASIA",   start: "18:00", end: "06:00" }
   - { name: "LONDON", start: "06:00", end: "12:00" }
   - { name: "NY",     start: "12:00", end: "21:00" }
 
-# === Legacy Asia window (still read by scanner as fallback) ===
+# ===========================
+# === Legacy Asia window (scanner fallback) ===
+# ===========================
 asia_start: "18:00"
 asia_end:   "09:00"
 tokyo_only: false
 
+# ===========================
 # === Geometry ===
+# ===========================
 zone_width_usd:    4.0
 sweep_buffer_usd:  0.1   # used when buffer_mode=usd
 
-# === Dynamic sweep buffer (new) ===
+# ===========================
+# === Dynamic sweep buffer ===
+# ===========================
 buffer_mode: "auto"        # "usd" | "pct" | "atr" | "auto"
 buffer_pct: 0.015          # 1.5% of the session box range
 buffer_atr_mult: 0.35      # 0.35 * ATR(15m) of session
 min_buffer_usd: 0.05
 max_buffer_usd: 0.60
 
+# ===========================
 # === Logic switches ===
+# ===========================
 require_pierce: false
 require_fvg:    false
 gap_filter:     0.005
 
-# === OB selection (new) ===
+# ===========================
+# === OB selection ===
+# ===========================
 strict_ob: true            # displacement + imbalance before picking OB
 ob_lookback_bars: 20
 disp_mult_atr: 1.2         # displacement body >= 1.2 * ATR(15m)
 
-# === Microstructure confirmation (new, optional) ===
+# ===========================
+# === Microstructure confirmation (optional) ===
+# ===========================
 use_m1_bos: true           # require a small M1 BOS into the band
 m1_bos_lookback_min: 12
 
+# ===========================
 # === Daily throughput ===
+# ===========================
 max_signals_per_day: 1
 both_sides_per_day:  true
 
-# === Bias filter (optional, off by default) ===
+# ===========================
+# === Bias filter (optional) ===
+# ===========================
 use_h1_bias: true         # if true: only BUY when H1 > EMA; SELL when H1 < EMA
 h1_ema_len: 50
 
+# ===========================
 # === MT5 connection ===
+# ===========================
 login: 81496583
 password: "Password2$"
 server: "Exness-MT5Trial10"
@@ -59,7 +81,9 @@ force_test_entry: false
 filling_override: ""          # "", "IOC", or "FOK"
 deviation: 500
 
+# ===========================
 # === Risk & target multipliers ===
+# ===========================
 risk_mult:      2.3
 tp1_mult:       0.68
 tp2_mult:       1.16
@@ -67,25 +91,31 @@ tp3_mult:       1.80       # try 1.8R first; tweak after results
 tp4_mult:       2.40       # optional; only used if use_tp4=true
 max_risk_ratio: 0.03
 
+# ===========================
 # === Volatility Controls ===
+# ===========================
 volatility_adjust: true
 atr_period:        14
 atr_multiplier:    3.0
 
+# ===========================
 # === Diagnostics ===
+# ===========================
 debug_days: 3
 
+# ===========================
 # === Trade Management ===
+# ===========================
 no_touch_timeout_hours: 5
 force_close_hours:      24
 
-# OVERTIME BEHAVIOR (NEW)
+# --- OVERTIME BEHAVIOR ---
 # After hard cutoff, give a short grace to try for the original TP.
 # If still open after grace, collapse remaining size to TP2 (or TP1) and hold until TP or SL.
 force_close_policy: "tp2"          # "final_close" | "tp2" | "tp1"
 max_extension_hours: 72            # hard cap after cutoff (performance & risk control)
-grace_hours: 6                     # NEW: keep aiming for original TP for this many hours after cutoff
-overtime_sl_mode: "tighten_to_half" # NEW: on switch, move SL halfway toward entry
+grace_hours: 6                     # keep aiming for original TP for this many hours after cutoff
+overtime_sl_mode: "tighten_to_half" # on switch, move SL halfway toward entry
 # Allowed values for overtime_sl_mode:
 #   "none"             → leave SL as-is
 #   "to_entry"         → set SL = entry (breakeven)
@@ -96,11 +126,13 @@ place_sl_on_entry:      false
 place_tp_on_entry:      "none"   # engine manages exits internally
 
 # NEW management switches
-be_after_tp1: false       # keep SL where it is; no BE hop
-use_tp3:      true        # TP3 enabled
-use_tp4:      false       # TP4 disabled
+be_after_tp1: false        # keep SL where it is; no BE hop
+use_tp3:      true         # TP3 enabled
+use_tp4:      false        # TP4 disabled
 
+# ===========================
 # === Single-target mode (one entry, one TP) ===
+# ===========================
 force_single_entry: true
 single_entry_target: 3    # 1 | 2 | 3 | 4
 
@@ -109,7 +141,9 @@ main_units:           0.0   # TP1
 runner_units:         0.0   # TP2
 extra_runner_units:   1.0   # TP3 (or TP4 if enabled)
 
+# ===========================
 # === Swap Fee Management ===
+# ===========================
 swap_avoidance:       false
 swap_cutoff_hour:     19        # UTC
 swap_buffer_hours:    3
@@ -117,24 +151,38 @@ wednesday_multiplier: 3
 swap_fee_long:        -5.10     # $ per lot per night
 swap_fee_short:        0.00     # $ per lot per night
 
+# ===========================
 # === Dealing costs ===
+# ===========================
 tick_size:                   0.0
 use_csv_spread:              false
 slip_usd_side_lot:           5.0
 commission_per_lot_per_side: 5.5
 
+# ===========================
 # === Slippage scaling ===
+# ===========================
 slippage_scale_threshold_lots: 1.5
 slippage_scale_factor:         1.0
 
+# ===========================
+# === Entry band guards ===
+# ===========================
+entry_band_guard_usd: 0.30
+entry_max_slip_usd:   2.0
+
+# ===========================
 # === Position Sizing ===
+# ===========================
 risk_per_trade:           0.05
 max_lots:                 10
 min_lot_size:             0.01
 lot_size_increment:       0.01
 dollar_per_unit_per_lot:  100.0
 
+# ===========================
 # === Entry logic (engine v10+) ===
+# ===========================
 entry_trigger: "band"            # "band" or "mid"
 band_side_buy: "upper"           # "upper" → [mid, high]
 band_side_sell: "lower"          # "lower" → [low, mid]
@@ -143,17 +191,47 @@ band_fill_price: "touch"         # ensures triggering inside the band
 entry_min_delay_minutes: 1       # allow instant fill after confirm
 entry_lot_boost: 1.5
 
+# ===========================
 # === Risk Management ===
+# ===========================
 day_loss_limit_pct: 0.05
 stop_on_negative_balance: true
 min_equity_usd: 0.0
 
-# retry behavior
+# ===========================
+# === Retry behavior ===
+# ===========================
 tries_per_fill_mode: 6
 retry_sleep_seconds: 0.12
 
+# ===========================
 # === Leverage / Margin ===
+# ===========================
 leverage: 1000
 
+# ===========================
 # === Account Capital ===
+# ===========================
 start_balance: 1000.0
+
+# ===========================
+# === Telegram ===
+# ===========================
+telegram:
+  enabled: true
+  bot_token: "8402900095:AAFW9vBIktOkbqtQgey3zZa7YKoFfd4ECFQ"
+  chat_id: "-1003008929937"
+  post_signals: true    # post initial signal cards
+  post_orders:  true    # edit message with "Placed/Retry/Failed"
+  post_exits:   true    # edit message on TP/SL/Closed
+
+telegram_store_file: "telegram_message_map.json"
+
+# ===========================
+# === Freshness & proximity guards (Notifier/Live) ===
+# ===========================
+freshness_minutes: 8            # replaces max_signal_age_minutes
+trigger_tolerance_usd: 0.02
+allow_outside_band_tolerance: 0.00
+send_stale_on_startup: false
+tg_include_times: true

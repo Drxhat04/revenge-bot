@@ -1,11 +1,12 @@
 #!/usr/bin/env python
 """
-XAUUSD OB / Liquidity-Sweep Scanner (v3.2, UTC-native, precomputed + cached)
+XAUUSD OB / Liquidity-Sweep Scanner (v3.3, UTC-native, precomputed + cached)
 ----------------------------------------------------------------------------
 • Precompute once: M15 bars, H1 bars + EMA(H1), 15m TR→ATR (for buffers)
 • Cache per-session hi/lo/buffer (no repeated resample inside loops)
 • Emit-time de-dup across overlapping sessions
 • No look-ahead; signals timestamped at next 15m open (UTC)
+• Emits downstream fields: ts_utc, band_lo, band_hi, trigger
 """
 
 from __future__ import annotations
@@ -101,14 +102,14 @@ def _precompute(m1: pd.DataFrame):
     global M1, M1I, M15, TR15, ATR15, H1, EMA_H1
     M1 = m1
     M1I = M1.set_index("time")
-    # 15m OHLC & TR/ATR
+    # 15m OHLC and TR/ATR
     M15 = (M1I.resample("15min")
            .agg({"open":"first","high":"max","low":"min","close":"last"})
            .dropna()
            .reset_index())
     TR15 = (M1I["tr"].resample("15min").mean())
     ATR15 = TR15.rolling(14, min_periods=1).mean()
-    # H1 OHLC & EMA
+    # H1 OHLC and EMA
     H1 = (M1I.resample("1H")
           .agg({"open":"first","high":"max","low":"min","close":"last"})
           .dropna())
@@ -120,8 +121,9 @@ def fvg_ok(prev: pd.Series, cur: pd.Series, side: str) -> bool:
     return (cur.low > prev.high) if side == "BUY" else (prev.low > cur.high)
 
 def last_opposite(df15: pd.DataFrame, idx: int, side: str) -> pd.Series:
-    mask = (df15.close < df15.open) if side == "BUY" else (df15.close > df15.open)
-    sub  = df15.loc[: idx - 1][mask]
+    mask_full = (df15.close < df15.open) if side == "BUY" else (df15.close > df15.open)
+    sub_slice = df15.iloc[:idx]
+    sub = sub_slice[mask_full.iloc[:idx]]
     return sub.iloc[-1] if not sub.empty else df15.iloc[idx - 1]
 
 def _strict_ob(df15: pd.DataFrame, idx: int, side: str) -> pd.Series:
@@ -150,7 +152,8 @@ def _strict_ob(df15: pd.DataFrame, idx: int, side: str) -> pd.Series:
     if disp_idx is None or disp_idx == 0:
         return last_opposite(df15, idx, side)
     opp_mask = (seg.close < seg.open) if side == "BUY" else (seg.close > seg.open)
-    opp = seg.iloc[:disp_idx][opp_mask]
+    opp_slice = seg.iloc[:disp_idx]
+    opp = opp_slice[opp_mask.iloc[:disp_idx]]
     return opp.iloc[-1] if not opp.empty else last_opposite(df15, idx, side)
 
 def _m1_bos_ok(signal_time: pd.Timestamp, side: str) -> bool:
@@ -195,7 +198,7 @@ _SESS_CACHE: dict[tuple[pd.Timestamp, pd.Timestamp], tuple[float,float,float]] =
 def _sess_stats(win_start: pd.Timestamp, win_end: pd.Timestamp) -> tuple[float,float,float]:
     """
     Return (hi, lo, BUF) using cached results.
-    BUF uses global ATR15 via end-of-window value (no resample here).
+    BUF uses global ATR15 via end-of-window value.
     """
     key = (win_start, win_end)
     if key in _SESS_CACHE:
@@ -308,7 +311,7 @@ def main() -> None:
     m1 = load_m1()
     print(f"Loaded rows: {len(m1):,}")
 
-    print("Precomputing frames (15m, H1, ATR15) …")
+    print("Precomputing frames (15m, H1, ATR15) ...")
     _precompute(m1)
 
     print("Scanning for sweep-OB zones in UTC (no look-ahead)")
@@ -317,38 +320,72 @@ def main() -> None:
         print("No zones found with current config.")
         return
 
+    # Keep existing fields
     zones["zone_width"] = zones.entry_high - zones.entry_low
     zones["entry_mid"]  = (zones.entry_low + zones.entry_high) / 2
 
-    # Post-scan minute gap filter (cheap with indexed M1)
+    # New downstream fields
+    # ts_utc: ensure timezone-aware UTC
+    zones["ts_utc"]  = pd.to_datetime(zones["datetime"], utc=True)
+
+    # Bands aligned to OB band
+    zones["band_lo"] = zones["entry_low"].astype(float)
+    zones["band_hi"] = zones["entry_high"].astype(float)
+
+    # Trigger: default midpoint; swap to your live band rule if desired
+    zones["trigger"] = zones["entry_mid"].astype(float)
+    # Example alternative:
+    # zones["trigger"] = np.where(zones["direction"].eq("BUY"), zones["band_hi"], zones["band_lo"]).astype(float)
+
+    # Post-scan minute gap filter using indexed M1
     valid = []
     m1i = M1I  # already indexed
+
     def _match_bar(ts: pd.Timestamp) -> pd.Series | None:
         try:
             exact = m1i.loc[ts:ts]
-            if not exact.empty: return exact.iloc[0]
-        except Exception: pass
+            if not exact.empty:
+                return exact.iloc[0]
+        except Exception:
+            pass
         win = m1i.loc[ts - pd.Timedelta(seconds=60): ts + pd.Timedelta(seconds=60)]
-        if win.empty: return None
+        if win.empty:
+            return None
         pos = win.index.get_indexer([ts], method="nearest")[0] if len(win) else 0
         return win.iloc[pos]
 
     for _, row in zones.iterrows():
-        bar = _match_bar(row.datetime)
+        bar = _match_bar(row.ts_utc)  # use ts_utc for consistency
         if bar is None:
-            valid.append(row); continue
+            valid.append(row)
+            continue
         prev_loc = m1i.index.get_indexer([bar.name], method="pad")[0] - 1
         if prev_loc >= 0:
             prev_close = float(m1i.iloc[prev_loc].close)
             denom = prev_close if prev_close else 1.0
             gap_ok = abs(float(bar.open) - prev_close) / abs(denom) <= GAP_FILTER
-            if gap_ok: valid.append(row)
+            if gap_ok:
+                valid.append(row)
         else:
             valid.append(row)
 
-    zones = pd.DataFrame(valid).drop_duplicates(subset=["datetime","direction","entry_low","entry_high"], keep="first")
-    zones = zones.sort_values("datetime")
-    zones.to_csv("signals_long_utc.csv", index=False)
+    zones = (
+        pd.DataFrame(valid)
+        .drop_duplicates(subset=["ts_utc","direction","band_lo","band_hi"], keep="first")
+        .sort_values("ts_utc")
+    )
+
+    # Reorder columns for clarity and downstream compatibility
+    out_cols = [
+        "ts_utc", "direction",
+        "band_lo", "band_hi", "trigger",
+        "atr", "ob_time", "confirm_time",
+        "zone_width", "entry_mid",
+        "datetime", "entry_low", "entry_high"
+    ]
+    # Keep only columns that exist (defensive in case config toggles omit some)
+    out_cols = [c for c in out_cols if c in zones.columns]
+    zones[out_cols].to_csv("signals_long_utc.csv", index=False)
     print(f"Generated {len(zones)} signals → signals_long_utc.csv")
 
 if __name__ == "__main__":

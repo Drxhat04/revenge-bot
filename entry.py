@@ -1,3 +1,6 @@
+# entry.py
+from __future__ import annotations
+from typing import Any
 import time
 import MetaTrader5 as mt5
 from datetime import datetime
@@ -33,10 +36,24 @@ def band_trigger_price(direction: str, lo: float, hi: float) -> float:
 
 def should_trigger_trade(direction: str, entry_low: float, entry_high: float,
                          bid: float, ask: float) -> tuple[bool, float]:
+    bl, bh, _ = _band_for(direction, entry_low, entry_high)
     trig = band_trigger_price(direction, entry_low, entry_high)
     if not isfinite(trig):
         return (False, trig)
-    return ((ask >= trig), trig) if direction == "BUY" else ((bid <= trig), trig)
+
+    # small buffer to allow tiny overshoots
+    buf = float(CONFIG.get("entry_band_guard_usd", 0.30))
+    # optional hard cap on distance from trigger
+    max_slip = float(CONFIG.get("entry_max_slip_usd", 0.80))
+
+    if direction.upper() == "BUY":
+        in_band = (bl - buf) <= ask <= (bh + buf)
+        close_enough = (ask - trig) <= max_slip
+        return (in_band and ask >= trig and close_enough, trig)
+    else:
+        in_band = (bl - buf) <= bid <= (bh + buf)
+        close_enough = (trig - bid) <= max_slip
+        return (in_band and bid <= trig and close_enough, trig)
 
 # ───────── helpers ─────────
 def _normalize_price(symbol: str, price: float) -> float:
@@ -104,14 +121,14 @@ def _supported_fillings(symbol: str):
     """
     Exness metals: restrict to IOC first, FOK second. Optional override via config to force IOC or FOK.
     """
-    ov = str(CONFIG.get("filling_override", "") or "").upper().strip()
+    ov = str(CONFIG.get("filling_override", "")).upper().strip()
     if ov == "IOC":
         return [(mt5.ORDER_FILLING_IOC, "IOC")]
     if ov == "FOK":
         return [(mt5.ORDER_FILLING_FOK, "FOK")]
     return [(mt5.ORDER_FILLING_IOC, "IOC"), (mt5.ORDER_FILLING_FOK, "FOK")]
 
-# ───────── SL/TP policy helpers (NEW) ─────────
+# ───────── SL/TP policy helpers ─────────
 def _compute_levels(direction: str, entry_price: float, stop_dist: float):
     tp1_mult = float(CONFIG.get("tp1_mult", 0.68))
     tp2_mult = float(CONFIG.get("tp2_mult", 1.16))
@@ -148,11 +165,33 @@ def _apply_sltp_policy(symbol: str, req: dict, direction: str,
     # else leave TP=0.0 (managed by code later)
 
 # ───────── entry (log each attempt) ─────────
-def send_market_order(direction: str, entry_price_ref: float, stop_dist: float,
-                      *, trigger_price: float | None = None) -> dict:
+def send_market_order(
+    direction: str,
+    entry_price_ref: float,
+    stop_dist: float,
+    *,
+    # Optional, informational only (no trading logic change):
+    trigger_price: float | None = None,
+    band_low: float | None = None,
+    band_high: float | None = None,
+    freshness_ok: bool | None = None,
+    near_trigger_ok: bool | None = None,
+    ts_utc: datetime | None = None,
+    # Existing plumbing:
+    notifier=None,
+    pending_key: str | None = None
+) -> dict:
+    """
+    Place a market order with retries and detailed attempt logging.
+
+    Notes on the new optional kwargs:
+      • trigger_price, band_low, band_high, freshness_ok, near_trigger_ok, ts_utc
+        are only embedded into the order comment (compact) and attempt logs (full)
+        so you can audit from Telegram and console. They DO NOT affect execution.
+    """
     symbol = CONFIG["symbol"]
 
-    # 1) Size — keep legacy 1.5× boost for parity with your "working" version
+    # 1) Size — keep legacy 1.5× boost for parity with prior version
     lot_boost = float(CONFIG.get("entry_lot_boost", 1.5))
     base_lots = calculate_position_size(stop_dist, entry_price_ref)
     if base_lots <= 0:
@@ -166,10 +205,23 @@ def send_market_order(direction: str, entry_price_ref: float, stop_dist: float,
     if total_lots <= 0:
         raise RuntimeError("Not enough free margin for requested volume")
 
-    # 3) Comment
+    # 3) Comment (very compact: broker truncates to ~24 chars)
     bits = [f"sd={stop_dist:.2f}"]
     if trigger_price is not None:
-        bits.append(f"trig={trigger_price:.2f}")
+        bits.append(f"t={trigger_price:.2f}")
+    if band_low is not None and band_high is not None:
+        # Keep short to survive truncation
+        bits.append(f"b={band_low:.2f}-{band_high:.2f}")
+    if freshness_ok is not None:
+        bits.append("F" if freshness_ok else "f")
+    if near_trigger_ok is not None:
+        bits.append("N" if near_trigger_ok else "n")
+    # Optional very short time tag
+    if ts_utc is not None:
+        try:
+            bits.append(ts_utc.strftime("%m%d%H%M"))
+        except Exception:
+            pass
     comment = " ".join(bits)
 
     attempts = []
@@ -191,65 +243,96 @@ def send_market_order(direction: str, entry_price_ref: float, stop_dist: float,
             "send_retcode": getattr(send_obj, "retcode", None) if send_obj is not None else None,
             "send_comment": getattr(send_obj, "comment", None) if send_obj is not None else None,
             "send_last_error": le,
+            # Context for audit (does not go to broker)
+            "ctx": {
+                "trigger_price": float(trigger_price) if trigger_price is not None else None,
+                "band_low": float(band_low) if band_low is not None else None,
+                "band_high": float(band_high) if band_high is not None else None,
+                "freshness_ok": bool(freshness_ok) if freshness_ok is not None else None,
+                "near_trigger_ok": bool(near_trigger_ok) if near_trigger_ok is not None else None,
+                "ts_utc": ts_utc.isoformat() if isinstance(ts_utc, datetime) else None,
+            }
         })
+
+    def _notify_retry(attempt_idx: int, retcode: Any, last_price: float):
+        if notifier and pending_key:
+            try:
+                if hasattr(notifier, "mark_pending_retry"):
+                    notifier.mark_pending_retry(pending_key, attempt=attempt_idx, retcode=retcode, last_price=last_price)
+            except Exception:
+                pass
 
     def _try_mode(fill_const, fill_label, place_sltp: bool, include_filling: bool) -> bool:
         nonlocal entry_result, requested_price
-        for _ in range(tries_per_mode):
+        for attempt_idx in range(1, tries_per_mode + 1):
             b, a = fetch_tick(symbol)
             price_used = _normalize_price(symbol, a if direction.upper() == "BUY" else b)
             requested_price = price_used
 
             req = _build_request(direction, symbol, price_used, total_lots, comment)
-            if include_filling:
+            if include_filling and fill_const is not None:
                 req["type_filling"] = fill_const
 
-            # NOTE: use price_used (live) for SL/TP math — matches your previous working behavior
             if place_sltp:
                 _apply_sltp_policy(symbol, req, direction, price_used, stop_dist)
 
-            # pre-check
             check = mt5.order_check(req)
             if check is None or getattr(check, "retcode", None) not in (mt5.TRADE_RETCODE_DONE, 0):
                 _log(fill_label, price_used, check, None)
+                _notify_retry(attempt_idx, getattr(check, "retcode", None), price_used)
                 time.sleep(pause)
                 continue
 
-            # send
             res = mt5.order_send(req)
             _log(fill_label, price_used, check, res)
 
-            if res is not None and getattr(res, "retcode", None) in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED):
+            rc = getattr(res, "retcode", None) if res is not None else None
+            if rc in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED):
                 entry_result = res
+                # Promote pending Telegram message to a ticket
+                try:
+                    magic = int(CONFIG.get("magic", 234000))
+                    allp = mt5.positions_get(symbol=symbol) or []
+                    newest = None
+                    for p in allp:
+                        if int(getattr(p, "magic", 0)) == magic:
+                            if newest is None or getattr(p, "time", 0) > getattr(newest, "time", 0):
+                                newest = p
+                    if notifier and pending_key and newest is not None:
+                        notifier.promote_pending_to_ticket(pending_key, int(newest.ticket))
+                        notifier.mark_placed(int(newest.ticket), sent_price=price_used, fill=fill_label)
+                except Exception:
+                    pass
                 return True
 
+            _notify_retry(attempt_idx, rc, price_used)
             time.sleep(pause)
         return False
 
-    fillings = _supported_fillings(symbol)  # typically IOC then FOK unless you forced it in config
+    fillings = _supported_fillings(symbol)
 
-    # A) IOC/FOK with SL/TP
     for fc, fl in fillings:
         if _try_mode(fc, fl, place_sltp=True, include_filling=True):
             break
-
-    # B) IOC/FOK without SL/TP (broker min-distance quirks)
     if entry_result is None:
         for fc, fl in fillings:
             if _try_mode(fc, f"{fl}-noSLTP", place_sltp=False, include_filling=True):
                 break
-
-    # C) AUTO filling (omit type_filling) — first without SL/TP, then with
     if entry_result is None:
         _try_mode(None, "AUTO-noSLTP", place_sltp=False, include_filling=False)
     if entry_result is None:
         _try_mode(None, "AUTO", place_sltp=True, include_filling=False)
 
-    # final last_error snapshot
     try:
         last_err = mt5.last_error()
     except Exception:
         last_err = None
+
+    if entry_result is None and notifier:
+        try:
+            notifier.mark_failed(ticket=None, retcode=getattr(last_err, "retcode", None))
+        except Exception:
+            pass
 
     return {
         "requested_lots": total_lots,
