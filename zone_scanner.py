@@ -10,6 +10,7 @@ XAUUSD OB / Liquidity-Sweep Scanner (v3.3, UTC-native, precomputed + cached)
 """
 
 from __future__ import annotations
+import talib as ta
 import pathlib, warnings, yaml, pandas as pd
 import numpy as np
 import datetime as _dt
@@ -110,7 +111,7 @@ def _precompute(m1: pd.DataFrame):
     TR15 = (M1I["tr"].resample("15min").mean())
     ATR15 = TR15.rolling(14, min_periods=1).mean()
     # H1 OHLC and EMA
-    H1 = (M1I.resample("1H")
+    H1 = (M1I.resample("1h")
           .agg({"open":"first","high":"max","low":"min","close":"last"})
           .dropna())
     EMA_H1 = H1["close"].ewm(span=H1_EMA_LEN, adjust=False).mean()

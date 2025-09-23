@@ -5,7 +5,8 @@
 #   • is_fresh(ts_utc): gate stale signals on startup and per loop
 #   • is_near_trigger(direction, bid, ask, trigger, band_lo, band_hi)
 #   • Telegram posts respect send_stale_on_startup and freshness window
-#   • Order placement requires both is_fresh and is_near_trigger
+#   • Signal cards are posted to Telegram before attempting live entries
+#   • Lower in-session sleep for higher cadence checks (configurable)
 #   • Backward-compatible with older scanner columns
 # ------------------------------------------------------------------
 
@@ -30,10 +31,10 @@ from notify_bridge import Notifier, _sig_key
 def _coerce_ts_utc(ts) -> datetime:
     """Coerce any pandas/python datetime (aware or naive) to a naive UTC datetime."""
     t = pd.Timestamp(ts)
+    # If tz-aware, convert to UTC then drop tzinfo; if naive, treat as already UTC
     if t.tzinfo is not None:
         t = t.tz_convert("UTC").tz_localize(None)
     else:
-        # Treat naive as UTC already
         t = t.tz_localize(None)
     return t.to_pydatetime()
 
@@ -355,7 +356,7 @@ def main_loop():
             last_zone_refresh = now
 
             if tg.enabled and not zones.empty:
-                _post_signals_to_telegram(zones, tg, posted_keys, startup=True)
+                _post_signals_to_telegram(zones, tg, posted_keys, startup=True, force_post=True)
 
         # Intraday zone refresh
         if (now - last_zone_refresh).total_seconds() >= refresh_secs:
@@ -365,12 +366,20 @@ def main_loop():
                     zones = new.reset_index(drop=True)
                     print(f"[{now}] Refreshed zones intraday: {len(zones)}")
                     if tg.enabled:
-                        _post_signals_to_telegram(zones, tg, posted_keys, startup=False)
+                        _post_signals_to_telegram(zones, tg, posted_keys, startup=False, force_post=True)
                 else:
                     print(f"[{now}] Intraday refresh: no zones.")
             except Exception as e:
                 print(f"[{now}] Intraday zone refresh failed: {e}")
             last_zone_refresh = now
+
+        # Ensure signals are posted to Telegram before attempting entries this tick.
+        # force_post=True guarantees the signal card is created for tracking even if price isn't near trigger.
+        if tg.enabled and not zones.empty:
+            try:
+                _post_signals_to_telegram(zones, tg, posted_keys, startup=False, force_post=True)
+            except Exception as e:
+                print(f"{now} → Telegram pre-post failed: {e}")
 
         # Gating
         in_session = within_trading_session(now)
@@ -399,7 +408,19 @@ def main_loop():
                 blo = float(z.get("band_lo", z.get("entry_low")))
                 bhi = float(z.get("band_hi", z.get("entry_high")))
                 trig = float(z.get("trigger", (blo + bhi) / 2.0))
-                direction = str(z.get("direction"))
+                # Normalize direction to uppercase for consistent comparisons
+                direction = str(z.get("direction")).upper()
+
+                # DEBUG: print zone + gate status
+                try:
+                    print(f"{now} → Checking zone: dir={direction}, bid/ask={bid:.2f}/{ask:.2f}, trigger={trig:.2f}, band={blo:.2f}-{bhi:.2f}")
+                except Exception:
+                    print(f"{now} → Checking zone: dir={direction}, trigger={trig}, band={blo}-{bhi}")
+
+                try:
+                    print(f"{now} → Fresh: {is_fresh(ts)}, Near trigger: {is_near_trigger(direction, bid, ask, trig, blo, bhi)}")
+                except Exception as e:
+                    print(f"{now} → Fresh/near-trigger debug failed: {e}")
 
                 # Freshness gate
                 if not is_fresh(ts):
@@ -513,8 +534,9 @@ def main_loop():
         except Exception as e:
             print(f"{now} → Trade management error: {e}")
 
-        # Pace
-        sleep_s = 60 if (not in_session or near_swap or daily_hit) else 20
+        # Pace: lower in-session sleep via CONFIG entry_loop_sleep_in_session (default 2s)
+        in_session_sleep = int(CONFIG.get("entry_loop_sleep_in_session", 2))
+        sleep_s = 60 if (not in_session or near_swap or daily_hit) else in_session_sleep
         time.sleep(sleep_s)
 
 
@@ -522,11 +544,15 @@ def _post_signals_to_telegram(zones: pd.DataFrame,
                               tg: Notifier,
                               posted_keys: set[str],
                               *,
-                              startup: bool):
+                              startup: bool,
+                              force_post: bool = False):
     """
     Post one Telegram 'signal card' per zone once per day.
     Only fresh signals are posted. On startup, stale announcements are skipped
     if CONFIG['send_stale_on_startup'] is False.
+
+    force_post: if True, bypass the notifier's near-trigger gating and freshness check
+                inside Notifier.post_signal so we always publish the signal card.
     """
     symbol = CONFIG["symbol"]
     allow_stale_on_start = bool(CONFIG.get("send_stale_on_startup", False))
@@ -537,12 +563,12 @@ def _post_signals_to_telegram(zones: pd.DataFrame,
         bhi = float(z.get("band_hi", z.get("entry_high")))
         direction = str(z.get("direction"))
 
-        # Freshness gating for announcements
+        # Freshness gating for announcements (local gate preserved)
         fresh = is_fresh(ts)
         if startup and not allow_stale_on_start and not fresh:
             continue
-        if not fresh:
-            # Even outside startup, do not spam stale signals
+        if not fresh and not force_post:
+            # Even outside startup, do not spam stale signals (unless forced)
             continue
 
         key = str(_sig_key(
@@ -566,6 +592,7 @@ def _post_signals_to_telegram(zones: pd.DataFrame,
         sl, tps = _fmt_levels_for_post(direction, entry_mid, stop_dist)
 
         try:
+            # Pass force_post down to Notifier.post_signal so we can bypass its internal gating
             res = tg.post_signal(
                 symbol=symbol,
                 side=direction,
@@ -573,6 +600,8 @@ def _post_signals_to_telegram(zones: pd.DataFrame,
                 sl=float(sl),
                 tps=tps,
                 when_utc=_coerce_ts_utc(ts),
+                bid=None, ask=None, trigger=None, band_lo=None, band_hi=None,
+                force_post=force_post
             )
             if res:
                 posted_keys.add(key)

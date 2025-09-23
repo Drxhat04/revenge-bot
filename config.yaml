@@ -77,7 +77,7 @@ password: "Password2$"
 server: "Exness-MT5Trial10"
 symbol: "XAUUSDz"
 use_live_mt5: true
-force_test_entry: false
+force_test_entry: true
 filling_override: ""          # "", "IOC", or "FOK"
 deviation: 500
 
@@ -103,6 +103,10 @@ atr_multiplier:    3.0
 # ===========================
 debug_days: 3
 
+# how often the live loop sleeps while inside a trading session (seconds)
+entry_loop_sleep_in_session: 2
+
+
 # ===========================
 # === Trade Management ===
 # ===========================
@@ -115,7 +119,7 @@ force_close_hours:      24
 force_close_policy: "tp2"          # "final_close" | "tp2" | "tp1"
 max_extension_hours: 72            # hard cap after cutoff (performance & risk control)
 grace_hours: 6                     # keep aiming for original TP for this many hours after cutoff
-overtime_sl_mode: "tighten_to_half" # on switch, move SL halfway toward entry
+overtime_sl_mode: "to_entry" # on switch, move SL halfway toward entry
 # Allowed values for overtime_sl_mode:
 #   "none"             → leave SL as-is
 #   "to_entry"         → set SL = entry (breakeven)
@@ -230,8 +234,19 @@ telegram_store_file: "telegram_message_map.json"
 # ===========================
 # === Freshness & proximity guards (Notifier/Live) ===
 # ===========================
-freshness_minutes: 8            # replaces max_signal_age_minutes
-trigger_tolerance_usd: 0.02
-allow_outside_band_tolerance: 0.00
+freshness_minutes: 240            # replaces max_signal_age_minutes
+trigger_tolerance_usd: 0.05
+allow_outside_band_tolerance: 0.30
 send_stale_on_startup: false
 tg_include_times: true
+
+# ===========================
+# === Range Detection (Scalping) ===
+# ===========================
+range_detection:
+  enabled: true
+  adx_period: 14
+  adx_threshold: 25  # Below this = ranging market
+  atr_period: 14
+  range_multiplier: 1.5  # ATR multiplier for range boundaries
+  min_range_width: 0.0   # Minimum USD range width to consider

@@ -1,4 +1,3 @@
-# notify_bridge.py
 from __future__ import annotations
 import os, json, threading
 from datetime import datetime, timezone, timedelta
@@ -142,19 +141,21 @@ class Notifier:
         freshness_minutes: int | None = None,
         trigger_tolerance_usd: float | None = None,
         allow_outside_band_tolerance: float | None = None,
+        force_post: bool = False,   # NEW: bypass near-trigger gating for announcements
     ):
         """
         Post a signal card. If live context is provided, we will:
-          - suppress sending if not _is_fresh(when_utc)
-          - suppress sending if not _is_near_trigger(...)
+          - suppress sending if not _is_fresh(when_utc) unless force_post is True
+          - suppress sending if not _is_near_trigger(...) unless force_post is True
         Also prints Sent: UTC (Hamburg local) and Price now / Trigger / Δ.
         """
         if not (self.enabled and self.post_signals):
             return None
 
-        # Freshness gate
-        if not _is_fresh(when_utc, freshness_minutes=freshness_minutes):
-            return None
+        # Freshness gate (unless forced)
+        if not force_post:
+            if not _is_fresh(when_utc, freshness_minutes=freshness_minutes):
+                return None
 
         # Compute display price_now/trigger/delta if possible
         price_now = None
@@ -168,8 +169,8 @@ class Notifier:
                 trigger_tolerance_usd=trigger_tolerance_usd,
                 allow_outside_band_tolerance=allow_outside_band_tolerance
             )
-            # Optional gating for send (required for trading, optional here — we enforce it per your spec)
-            if not near_ok:
+            # Only enforce near_ok when not forced
+            if not near_ok and not force_post:
                 return None
 
         mid, base = self.client.post_signal(
